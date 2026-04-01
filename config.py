@@ -1,18 +1,18 @@
-# ──────────────────────────────────────────────────────────────────────────────
 # Business-configurable settings
-# ──────────────────────────────────────────────────────────────────────────────
 
-# A/B/C classification thresholds.
-# Key: normalized xa_phuong string.
-# Value: {"A": vt1_min_for_A, "B": vt1_min_for_B}
-# Segments below the B threshold are classified as C.
-# Business fills this in before go-live.
-CLASSIFICATION_RULES: dict[str, dict[str, int]] = {
-    # Example (replace with real values from business):
-    # "quan 1": {"A": 200_000_000, "B": 100_000_000},
-}
+# A/B/C classification thresholds based on vt1 price (VND).
+# Range semantics:
+# - A: vt1 <= CLASSIFICATION_A_MAX
+# - B: CLASSIFICATION_A_MAX < vt1 <= CLASSIFICATION_B_MAX
+# - C: vt1 > CLASSIFICATION_B_MAX
+#
+# Boundary behavior:
+# - 100,000,000 is classified as A
+# - 200,000,000 is classified as B
+CLASSIFICATION_A_MAX = 100_000_000
+CLASSIFICATION_B_MAX = 200_000_000
 
-# Default group when xa_phuong has no rule configured.
+# Default group when vt1 is missing.
 CLASSIFICATION_DEFAULT = "C"
 
 # Number of days used for velocity calculation in ETA.

@@ -35,7 +35,37 @@ class EformRepository:
             xa_phuong_norm=xa_phuong_norm,
             ten_duong_norm=ten_duong_norm,
             doan_key_norm=doan_key_norm,
+            is_active=True,  # never match deactivated segments
         ).first()
+
+    def get_distinct_tinh_thanh(self, session) -> list:
+        """Sorted distinct province display names from active segments.
+        Deduped by tinh_thanh_norm — one display label per normalized value."""
+        rows = session.query(Segment.tinh_thanh, Segment.tinh_thanh_norm).filter(
+            Segment.is_active == True
+        ).distinct().all()
+        seen_norm = {}
+        for display, norm in rows:
+            if display and norm and norm not in seen_norm:
+                seen_norm[norm] = display
+        return sorted(seen_norm.values())
+
+    def get_distinct_xa_phuong(self, session, tinh_thanh: str = None) -> list:
+        """Sorted distinct ward/zone display names from active segments.
+        If tinh_thanh provided, scoped to that province.
+        Deduped by xa_phuong_norm — one display label per normalized value."""
+        from src.utils.text import normalize
+        q = session.query(Segment.xa_phuong, Segment.xa_phuong_norm).filter(
+            Segment.is_active == True
+        )
+        if tinh_thanh:
+            q = q.filter(Segment.tinh_thanh_norm == normalize(tinh_thanh))
+        rows = q.distinct().all()
+        seen_norm = {}
+        for display, norm in rows:
+            if display and norm and norm not in seen_norm:
+                seen_norm[norm] = display
+        return sorted(seen_norm.values())
 
     def get_segment_by_id(self, session, segment_id: int):
         return session.query(Segment).filter_by(id=segment_id).first()

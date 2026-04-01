@@ -11,14 +11,25 @@ from datetime import datetime
 
 class AbstractCollectionClient(ABC):
     @abstractmethod
-    def fetch_records(self, since: datetime, page: int, page_size: int) -> dict:
+    def fetch_records(
+        self,
+        since: datetime,
+        page: int,
+        page_size: int,
+        last_record_id: str = None,
+    ) -> dict:
         """
         Fetch records from the collection app API.
 
         Args:
-            since:     Only return records updated at or after this timestamp.
-            page:      1-based page number.
-            page_size: Number of records per page.
+            since:          Only return records updated at or after this timestamp.
+            page:           1-based page number.
+            page_size:      Number of records per page.
+            last_record_id: On page 1, the source record ID of the last record
+                            processed in the previous sync. The API should skip
+                            records at the boundary timestamp that were already
+                            seen (tie-breaking for same-timestamp batches).
+                            Ignored on page > 1. May be None on first-ever sync.
 
         Returns:
             {
@@ -44,5 +55,11 @@ class AbstractCollectionClient(ABC):
 class StubCollectionClient(AbstractCollectionClient):
     """Returns empty results — used until the real API is built."""
 
-    def fetch_records(self, since: datetime, page: int, page_size: int) -> dict:
+    def fetch_records(
+        self,
+        since: datetime,
+        page: int,
+        page_size: int,
+        last_record_id: str = None,
+    ) -> dict:
         return {'records': [], 'has_next': False}

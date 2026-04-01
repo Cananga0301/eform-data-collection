@@ -20,7 +20,7 @@ import streamlit as st
 from src.config.static_config import StaticConfig
 from src.config.postgresql.postgresql_client import PostgreSQLClient
 from src.repository.eform_repository import EformRepository
-from src.service.importer_service import ImporterService
+from src.service.importer_service import ImporterService, ImportValidationError
 from src.service.classifier_service import ClassifierService
 from src.service.assigner_service import AssignerService
 from src.service.syncer_service import SyncerService
@@ -56,7 +56,7 @@ PAGES = [
     'Progress Dashboard',
     'Unmapped Records',
     'Reports',
-    'Verification (T5)',
+    'Verification',
 ]
 
 # ── Sidebar navigation ────────────────────────────────────────────────────────
@@ -77,16 +77,31 @@ if page == 'Import & Classify':
     if st.button('Run Import') and uploaded:
         import tempfile, os as _os
         results = []
+        errors = []
         for f in uploaded:
             with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
                 tmp.write(f.read())
                 tmp_path = tmp.name
             try:
-                result = svc['importer'].import_excel(tmp_path)
-                results.append({'file': f.name, **result})
+                result = svc['importer'].import_excel(tmp_path, source_name=f.name)
+                results.append({'file': f.name, 'status': 'success', **result, 'message': ''})
+            except ImportValidationError as exc:
+                results.append({
+                    'file': f.name,
+                    'status': 'error',
+                    'upserted': None,
+                    'deactivated': None,
+                    'message': str(exc),
+                })
+                errors.append(str(exc))
             finally:
                 _os.unlink(tmp_path)
-        st.success('Import complete.')
+        if errors:
+            st.warning('Import finished with errors.')
+            for message in errors:
+                st.error(message)
+        else:
+            st.success('Import complete.')
         st.dataframe(results)
 
 # ── Page 2: HO Review / Group Override ───────────────────────────────────────
@@ -99,12 +114,39 @@ elif page == 'HO Review / Group Override':
 
     with col1:
         st.subheader('Export Review File')
+
+        with svc['repo'].session_scope() as session:
+            ho_province_options = svc['repo'].get_distinct_tinh_thanh(session)
+
+        ho_province_choice = st.selectbox(
+            'Province',
+            options=['All provinces'] + ho_province_options,
+            key='ho_province',
+        )
+        ho_selected_province = None if ho_province_choice == 'All provinces' else ho_province_choice
+
+        with svc['repo'].session_scope() as session:
+            ho_ward_options = svc['repo'].get_distinct_xa_phuong(session, tinh_thanh=ho_selected_province)
+
+        ho_ward_choice = st.selectbox(
+            'Ward / Zone',
+            options=['All wards'] + ho_ward_options,
+            key='ho_ward',
+        )
+        ho_selected_ward = None if ho_ward_choice == 'All wards' else ho_ward_choice
+
         if st.button('Export HO Review Excel'):
             import pandas as pd
             from io import BytesIO
+            from src.utils.text import normalize
             with svc['repo'].session_scope() as session:
                 from src.models.eform_models import Segment
-                segs = session.query(Segment).filter_by(is_active=True).all()
+                q = session.query(Segment).filter_by(is_active=True)
+                if ho_selected_province:
+                    q = q.filter(Segment.tinh_thanh_norm == normalize(ho_selected_province))
+                if ho_selected_ward:
+                    q = q.filter(Segment.xa_phuong_norm == normalize(ho_selected_ward))
+                segs = q.all()
                 rows = [{
                     'segment_id': s.id, 'tinh_thanh': s.tinh_thanh,
                     'xa_phuong': s.xa_phuong, 'ten_duong': s.ten_duong,
@@ -114,7 +156,10 @@ elif page == 'HO Review / Group Override':
             df = pd.DataFrame(rows)
             buf = BytesIO()
             df.to_excel(buf, index=False)
-            st.download_button('Download', buf.getvalue(), 'ho_review.xlsx')
+            st.session_state['ho_review_export'] = buf.getvalue()
+
+        if st.session_state.get('ho_review_export'):
+            st.download_button('Download', st.session_state['ho_review_export'], 'ho_review.xlsx')
 
     with col2:
         st.subheader('Re-import Group Changes')
@@ -161,23 +206,50 @@ elif page == 'Branch Mapping':
             st.rerun()
 
     st.subheader('Add Mapping')
-    with st.form('add_mapping'):
-        key_type = st.selectbox('Key type', ['xa_phuong', 'tinh_thanh'])
-        key_value = st.text_input('Key value (will be normalized)')
-        branch_target = st.selectbox('Map to branch', branch_names) if branch_names else None
-        if st.form_submit_button('Save Mapping') and key_value.strip() and branch_target:
-            from src.models.eform_models import Branch, BranchMapping
-            from src.utils.text import normalize
-            with svc['repo'].session_scope() as session:
-                branch = session.query(Branch).filter_by(name=branch_target).first()
-                if branch:
-                    session.merge(BranchMapping(
+
+    with svc['repo'].session_scope() as session:
+        bm_province_options = svc['repo'].get_distinct_tinh_thanh(session)
+    with svc['repo'].session_scope() as session:
+        bm_ward_options = svc['repo'].get_distinct_xa_phuong(session)
+
+    key_type = st.selectbox('Key type', ['xa_phuong', 'tinh_thanh'], key='bm_key_type')
+    kv_options = bm_province_options if key_type == 'tinh_thanh' else bm_ward_options
+    key_value = st.selectbox('Key value', kv_options, key='bm_key_value') if kv_options else None
+    branch_target = st.selectbox('Map to branch', branch_names, key='bm_branch') if branch_names else None
+
+    if st.session_state.get('bm_saved'):
+        st.success(st.session_state['bm_saved'])
+        del st.session_state['bm_saved']
+
+    if st.button('Save Mapping') and key_value and branch_target:
+        from src.models.eform_models import Branch, BranchMapping
+        from src.utils.text import normalize
+        saved_branch_id = None
+        norm_key = normalize(key_value.strip())
+        with svc['repo'].session_scope() as session:
+            branch = session.query(Branch).filter_by(name=branch_target).first()
+            if branch:
+                existing = session.query(BranchMapping).filter_by(
+                    key_type=key_type,
+                    key_value=norm_key,
+                ).first()
+                if existing:
+                    existing.branch_id = branch.id  # update existing mapping
+                else:
+                    session.add(BranchMapping(
                         branch_id=branch.id,
                         key_type=key_type,
-                        key_value=normalize(key_value.strip()),
+                        key_value=norm_key,
                     ))
-            st.success('Mapping saved.')
-            st.rerun()
+                saved_branch_id = branch.id
+        if saved_branch_id:
+            n = svc['importer'].apply_single_mapping(key_type, norm_key, saved_branch_id)
+            st.session_state['bm_saved'] = (
+                f'Mapping saved: {key_type} "{key_value}" → {branch_target}  '
+                f'({n} segment{"s" if n != 1 else ""} updated)'
+            )
+        st.rerun()
+
 
 # ── Page 4: Assignment Export / Import ───────────────────────────────────────
 
@@ -187,14 +259,34 @@ elif page == 'Assignment Export / Import':
     col1, col2 = st.columns(2)
     with col1:
         st.subheader('Export')
-        tinh_thanh_filter = st.text_input('Filter by province (tinh_thanh)', '')
-        xa_phuong_filter = st.text_input('Filter by ward/zone (xa_phuong)', '')
+
+        with svc['repo'].session_scope() as session:
+            province_options = svc['repo'].get_distinct_tinh_thanh(session)
+
+        province_choice = st.selectbox(
+            'Province',
+            options=['All provinces'] + province_options,
+        )
+        selected_province = None if province_choice == 'All provinces' else province_choice
+
+        with svc['repo'].session_scope() as session:
+            ward_options = svc['repo'].get_distinct_xa_phuong(session, tinh_thanh=selected_province)
+
+        ward_choice = st.selectbox(
+            'Ward / Zone',
+            options=['All wards'] + ward_options,
+        )
+        selected_ward = None if ward_choice == 'All wards' else ward_choice
+
         if st.button('Export Assignment Excel'):
             data = svc['assigner'].export_assignment_excel(
-                tinh_thanh=tinh_thanh_filter or None,
-                xa_phuong=xa_phuong_filter or None,
+                tinh_thanh=selected_province,
+                xa_phuong=selected_ward,
             )
-            st.download_button('Download', data, 'assignment.xlsx')
+            st.session_state['assignment_export'] = data  # persist across reruns
+
+        if st.session_state.get('assignment_export'):
+            st.download_button('Download', st.session_state['assignment_export'], 'assignment.xlsx')
 
     with col2:
         st.subheader('Re-import')
@@ -229,13 +321,81 @@ elif page == 'Sync Status':
 
 elif page == 'Progress Dashboard':
     st.header('Progress Dashboard')
+    import pandas as pd
 
-    metrics = svc['reporter'].get_dashboard_metrics()
+    with svc['repo'].session_scope() as session:
+        dash_province_options = svc['repo'].get_distinct_tinh_thanh(session)
+
+    dash_province_choice = st.selectbox(
+        'Province',
+        options=['All provinces'] + dash_province_options,
+        key='dash_province',
+    )
+    dash_selected_province = None if dash_province_choice == 'All provinces' else dash_province_choice
+
+    with svc['repo'].session_scope() as session:
+        dash_ward_options = svc['repo'].get_distinct_xa_phuong(session, tinh_thanh=dash_selected_province)
+
+    dash_ward_choice = st.selectbox(
+        'Ward / Zone',
+        options=['All wards'] + dash_ward_options,
+        key='dash_ward',
+    )
+    dash_selected_ward = None if dash_ward_choice == 'All wards' else dash_ward_choice
+
+    dashboard = svc['reporter'].get_dashboard_data(
+        tinh_thanh=dash_selected_province,
+        xa_phuong=dash_selected_ward,
+    )
+    metrics = dashboard['metrics']
+    status_counts = dashboard['status_counts']
     col1, col2, col3, col4 = st.columns(4)
     col1.metric('Total Needed', metrics['total_needed'])
     col2.metric('Collected', metrics['total_collected'])
     col3.metric('% Complete', f"{metrics['pct_complete']}%")
     col4.metric('ETA', metrics['eta'])
+
+    extra_col1, extra_col2 = st.columns(2)
+    extra_col1.metric('Số đoạn đường chưa bắt đầu', status_counts['not_started'])
+    extra_col2.metric('Số đoạn đường đang thu thập', status_counts['in_progress'])
+
+    st.progress(min(max(metrics['pct_complete'] / 100, 0.0), 1.0))
+
+    st.subheader('Overview Breakdown')
+    overview_df = pd.DataFrame(dashboard['overview'])
+    if overview_df.empty:
+        st.info('No grouped progress data for the current filter.')
+    else:
+        st.dataframe(overview_df, use_container_width=True, hide_index=True)
+
+    st.subheader('Branch Activity')
+    st.caption(f"Branches with no new records in the last {dashboard['recent_days']} days are flagged.")
+    branch_df = pd.DataFrame(dashboard['branch_activity'])
+    if branch_df.empty:
+        st.info('No branch activity rows for the current filter.')
+    else:
+        st.dataframe(branch_df, use_container_width=True, hide_index=True)
+
+    st.subheader('White Zones')
+    white_zone_df = pd.DataFrame(dashboard['white_zones'])
+    if white_zone_df.empty:
+        st.success('No A/B white zones in the current filter.')
+    else:
+        st.dataframe(white_zone_df, use_container_width=True, hide_index=True)
+
+    st.subheader('Export Current View')
+    if st.button('Prepare Dashboard Export'):
+        st.session_state['dashboard_export'] = svc['reporter'].export_dashboard_excel(
+            tinh_thanh=dash_selected_province,
+            xa_phuong=dash_selected_ward,
+        )
+
+    if st.session_state.get('dashboard_export'):
+        st.download_button(
+            'Download Dashboard Excel',
+            st.session_state['dashboard_export'],
+            'dashboard.xlsx',
+        )
 
 # ── Page 7: Unmapped Records ──────────────────────────────────────────────────
 
@@ -275,10 +435,10 @@ elif page == 'Reports':
         data = svc['reporter'].generate_daily_report(report_date=report_date)
         st.download_button('Download Excel', data, f'report_{report_date}.xlsx')
 
-# ── Page 9: Verification (T5) ─────────────────────────────────────────────────
+# ── Page 9: Verification ──────────────────────────────────────────────────────
 
-elif page == 'Verification (T5)':
-    st.header('Data Verification (T5)')
+elif page == 'Verification':
+    st.header('Verification')
 
     inspector = st.text_input('Inspector name', 'system')
     if st.button('Run Auto-Checks'):

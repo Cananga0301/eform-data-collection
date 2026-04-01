@@ -114,8 +114,8 @@ class AssignerService:
                         pass
                 if row.get('branch'):
                     branch_name = str(row['branch']).strip()
-                    branch = session.query(Branch).filter_by(name=branch_name).first()
-                    if branch:
+                    branch = self._get_or_create_branch(session, branch_name)
+                    if branch is not None:
                         assignment.branch_id = branch.id
 
                 assignment.imported_at = datetime.utcnow()
@@ -150,3 +150,18 @@ class AssignerService:
             normalize(str(ten_duong)),
             normalize(str(doan_key)),
         )
+
+    def _get_or_create_branch(self, session, branch_name: str) -> Optional[Branch]:
+        branch_name = str(branch_name).strip()
+        if not branch_name:
+            return None
+
+        branch = session.query(Branch).filter_by(name=branch_name).first()
+        if branch is not None:
+            return branch
+
+        branch = Branch(name=branch_name)
+        session.add(branch)
+        session.flush()
+        logger.info("Auto-created branch from assignment import: %s", branch_name)
+        return branch

@@ -43,7 +43,12 @@ class SyncerService:
             last_record_id = cursor.last_record_id
 
             while True:
-                result = self.client.fetch_records(since=since, page=page, page_size=PAGE_SIZE)
+                result = self.client.fetch_records(
+                    since=since,
+                    page=page,
+                    page_size=PAGE_SIZE,
+                    last_record_id=last_record_id if page == 1 else None,
+                )
                 records = result.get('records', [])
                 if not records:
                     break
@@ -145,14 +150,35 @@ class SyncerService:
 
         existing_cr = self.repo.get_collected_record_by_source_id(session, source_id)
         if existing_cr:
+            old_segment_id = existing_cr.segment_id
             existing_cr.last_synced_at = now
             existing_cr.raw_data = raw
             existing_cr.vi_tri = raw.get('vi_tri')
             existing_cr.is_active = True
+
             if segment:
                 existing_cr.segment_id = segment.id
-            if segment:
                 self._recalculate_status(session, segment)
+            else:
+                existing_cr.segment_id = None  # clear stale mapping
+                already_unmapped = session.query(UnmappedRecord).filter_by(
+                    source_record_id=source_id, resolved=False
+                ).first()
+                if not already_unmapped:
+                    session.add(UnmappedRecord(
+                        source_record_id=source_id,
+                        raw_data=raw,
+                        reason='segment_not_found_on_update',
+                        resolved=False,
+                        sync_log_id=sync_log_id,
+                    ))
+
+            # Recalculate old segment if this record was removed from it
+            if old_segment_id and old_segment_id != (segment.id if segment else None):
+                old_seg = self.repo.get_segment_by_id(session, old_segment_id)
+                if old_seg:
+                    self._recalculate_status(session, old_seg)
+
             return segment is not None
         else:
             cr = CollectedRecord(
@@ -181,6 +207,40 @@ class SyncerService:
 
             self._recalculate_status(session, segment)
             return True
+
+    def _passes_auto_checks(self, session, segment: Segment, active_positions: list) -> bool:
+        """Inline T5 quick-checks. Quantity already confirmed by caller."""
+        from sqlalchemy import func
+        from src.models.eform_models import CollectedRecord as CR
+
+        active_vtrs = {vt for vt, _ in active_positions}
+
+        # No duplicate source_record_ids per segment + vi_tri
+        dup = (
+            session.query(CR.vi_tri)
+            .filter_by(segment_id=segment.id, is_active=True)
+            .group_by(CR.source_record_id, CR.vi_tri)
+            .having(func.count(CR.id) > 1)
+            .first()
+        )
+        if dup:
+            return False
+
+        # No records at positions that don't exist for this segment
+        wrong = (
+            session.query(CR.vi_tri)
+            .filter(
+                CR.segment_id == segment.id,
+                CR.is_active == True,
+                CR.vi_tri.notin_(list(active_vtrs)),
+            )
+            .first()
+        )
+        if wrong:
+            return False
+
+        # Required fields: not configured → auto-pass
+        return True
 
     def _find_segment(self, session, raw: dict):
         doan = raw.get('doan') or ''
@@ -219,6 +279,9 @@ class SyncerService:
         if all(c == 0 for c in counts.values()):
             segment.trang_thai = 'Chưa bắt đầu'
         elif all(counts[vt] >= req for vt, req in active_positions):
-            segment.trang_thai = 'Đủ vị trí'
+            if self._passes_auto_checks(session, segment, active_positions):
+                segment.trang_thai = 'Hoàn thành'
+            else:
+                segment.trang_thai = 'Đủ vị trí'  # manual fix needed via Page 9
         else:
             segment.trang_thai = 'Đang thu thập'

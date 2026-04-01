@@ -2,6 +2,8 @@
 
 E-Form Data Collection is a standalone Flask + PostgreSQL project for managing route import, A/B/C classification, assignment files, sync, reporting, and verification for the e-form collection workflow.
 
+Feature Guide: [docs/features.md](/C:/Users/phukt/gathering_data/eform-data-collection/docs/features.md)
+
 ## Tech Stack
 
 - Python 3.11
