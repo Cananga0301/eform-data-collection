@@ -1,0 +1,17 @@
+[
+  {
+    "id": "TEST-HCM-S3-001",
+    "tinh_thanh": "TP. Hồ Chí Minh",
+    "xa_phuong": "Đặc khu Côn Đảo",
+    "ten_duong": "Đường Cỏ Ống (Cách Mạng Tháng 8)",
+    "doan": "Từ Sân Bay Côn Sơn đến Đường Tây Bắc (Trạm Kiểm Lâm Cỏ Ống)",
+    "vi_tri": 1,
+    "updated_at": "2026-03-11T09:00:00+00:00",
+    "created_at": "2026-03-08T07:30:00+00:00",
+    "is_deleted": true,
+    "company": "Hdbank",
+    "employeeCode": "HD011001",
+    "importer": "hd011001@hdbank.com.vn",
+    "status": "INACTIVE"
+  }
+]

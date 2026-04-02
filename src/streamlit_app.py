@@ -108,80 +108,200 @@ if page == 'Import & Classify':
 
 elif page == 'HO Review / Group Override':
     st.header('HO Review / Group Override')
-    st.write('Export a review Excel with editable nhom column, then re-import to apply changes.')
 
-    col1, col2 = st.columns(2)
+    # ── Filter row ───────────────────────────────────────────────────────────
+    with svc['repo'].session_scope() as session:
+        ho_province_options = svc['repo'].get_distinct_tinh_thanh(session)
 
-    with col1:
-        st.subheader('Export Review File')
-
-        with svc['repo'].session_scope() as session:
-            ho_province_options = svc['repo'].get_distinct_tinh_thanh(session)
-
+    f_col1, f_col2, f_col3 = st.columns([3, 3, 2], vertical_alignment='bottom')
+    with f_col1:
         ho_province_choice = st.selectbox(
-            'Province',
-            options=['All provinces'] + ho_province_options,
-            key='ho_province',
+            'Province', ['All provinces'] + ho_province_options, key='ho_province'
         )
-        ho_selected_province = None if ho_province_choice == 'All provinces' else ho_province_choice
+    ho_selected_province = None if ho_province_choice == 'All provinces' else ho_province_choice
 
-        with svc['repo'].session_scope() as session:
-            ho_ward_options = svc['repo'].get_distinct_xa_phuong(session, tinh_thanh=ho_selected_province)
+    with svc['repo'].session_scope() as session:
+        ho_ward_options = svc['repo'].get_distinct_xa_phuong(session, tinh_thanh=ho_selected_province)
 
+    with f_col2:
         ho_ward_choice = st.selectbox(
-            'Ward / Zone',
-            options=['All wards'] + ho_ward_options,
-            key='ho_ward',
+            'Ward / Zone', ['All wards'] + ho_ward_options, key='ho_ward'
         )
-        ho_selected_ward = None if ho_ward_choice == 'All wards' else ho_ward_choice
+    ho_selected_ward = None if ho_ward_choice == 'All wards' else ho_ward_choice
 
-        if st.button('Export HO Review Excel'):
-            import pandas as pd
-            from io import BytesIO
-            from src.utils.text import normalize
-            with svc['repo'].session_scope() as session:
-                from src.models.eform_models import Segment
-                q = session.query(Segment).filter_by(is_active=True)
-                if ho_selected_province:
-                    q = q.filter(Segment.tinh_thanh_norm == normalize(ho_selected_province))
-                if ho_selected_ward:
-                    q = q.filter(Segment.xa_phuong_norm == normalize(ho_selected_ward))
-                segs = q.all()
-                rows = [{
-                    'segment_id': s.id, 'tinh_thanh': s.tinh_thanh,
-                    'xa_phuong': s.xa_phuong, 'ten_duong': s.ten_duong,
-                    'doan': s.doan or '', 'nhom': s.nhom or '',
-                    'vt1': s.vt1, 'nhom_manual': s.nhom_manual,
-                } for s in segs]
-            df = pd.DataFrame(rows)
-            buf = BytesIO()
-            df.to_excel(buf, index=False)
-            st.session_state['ho_review_export'] = buf.getvalue()
+    both_selected = ho_selected_province is not None and ho_selected_ward is not None
+    with f_col3:
+        load_clicked = st.button(
+            'Load Segments', use_container_width=True, disabled=not both_selected
+        )
+    if not both_selected:
+        st.caption('Select both a province and a ward / zone to load segments.')
 
-        if st.session_state.get('ho_review_export'):
-            st.download_button('Download', st.session_state['ho_review_export'], 'ho_review.xlsx')
+    # ── Load ─────────────────────────────────────────────────────────────────
+    if load_clicked and both_selected:
+        import pandas as pd
+        from src.utils.text import normalize
+        with svc['repo'].session_scope() as session:
+            from src.models.eform_models import Segment
+            segs = (
+                session.query(Segment)
+                .filter(
+                    Segment.is_active == True,
+                    Segment.tinh_thanh_norm == normalize(ho_selected_province),
+                    Segment.xa_phuong_norm == normalize(ho_selected_ward),
+                )
+                .order_by(Segment.ten_duong, Segment.doan)
+                .all()
+            )
+            rows = [{
+                'selected': False,
+                'segment_id': s.id,
+                'ten_duong': s.ten_duong or '',
+                'doan': s.doan or '',
+                'vt1': s.vt1,
+                'nhom': s.nhom or '',
+                'nhom_manual': bool(s.nhom_manual),
+            } for s in segs]
+        df = pd.DataFrame(rows)
+        st.session_state['ho_segments_df'] = df
+        st.session_state['ho_segments_original'] = df.copy()
+        st.session_state['ho_editor_version'] = st.session_state.get('ho_editor_version', 0) + 1
+        # clear stale select-all state so it can't bleed into the new table
+        st.session_state.pop('_ho_select_all_prev', None)
+        st.session_state.pop('ho_segments_edited', None)
 
-    with col2:
-        st.subheader('Re-import Group Changes')
-        ho_file = st.file_uploader('Upload filled HO review file', type=['xlsx'], key='ho_reimport')
-        if st.button('Apply Group Changes') and ho_file:
-            import pandas as pd
-            from datetime import datetime
-            df = pd.read_excel(ho_file, dtype=str)
-            df = df.where(pd.notna(df), None)
-            updated = 0
-            with svc['repo'].session_scope() as session:
-                from src.models.eform_models import Segment
-                for _, row in df.iterrows():
-                    if not row.get('segment_id'):
-                        continue
-                    seg = svc['repo'].get_segment_by_id(session, int(row['segment_id']))
-                    if seg and row.get('nhom') and row['nhom'] != seg.nhom:
-                        seg.nhom = str(row['nhom']).strip().upper()
-                        seg.nhom_manual = True
-                        seg.updated_at = datetime.utcnow()
-                        updated += 1
-            st.success(f'Updated nhom for {updated} segments.')
+    # ── Table + bulk apply ───────────────────────────────────────────────────
+    if 'ho_segments_df' in st.session_state:
+        import pandas as pd
+        if st.session_state['ho_segments_df'].empty:
+            st.info('No segments found for the selected filter.')
+        else:
+            df = st.session_state['ho_segments_df']
+            st.caption(f'{len(df)} segments loaded')
+
+            # ── Select-all + bulk apply controls ────────────────────────────
+            ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([3, 4, 2], vertical_alignment='bottom')
+            with ctrl_col1:
+                sa_c1, sa_c2 = st.columns(2)
+                with sa_c1:
+                    if st.button('Select all', use_container_width=True):
+                        upd = st.session_state.get('ho_segments_edited', st.session_state['ho_segments_df']).copy()
+                        upd['selected'] = True
+                        st.session_state['ho_segments_df'] = upd
+                        st.session_state['ho_editor_version'] = (
+                            st.session_state.get('ho_editor_version', 0) + 1
+                        )
+                with sa_c2:
+                    if st.button('Deselect all', use_container_width=True):
+                        upd = st.session_state.get('ho_segments_edited', st.session_state['ho_segments_df']).copy()
+                        upd['selected'] = False
+                        st.session_state['ho_segments_df'] = upd
+                        st.session_state['ho_editor_version'] = (
+                            st.session_state.get('ho_editor_version', 0) + 1
+                        )
+            with ctrl_col2:
+                bulk_nhom = st.selectbox(
+                    'Set all selected rows to:', ['(no change)', 'A', 'B', 'C'],
+                    key='ho_bulk_nhom',
+                )
+            with ctrl_col3:
+                if st.button('Apply to selected', use_container_width=True) and bulk_nhom != '(no change)':
+                    upd = st.session_state.get('ho_segments_edited', st.session_state['ho_segments_df']).copy()
+                    mask = upd['selected'].fillna(False).astype(bool)
+                    upd.loc[mask, 'nhom'] = bulk_nhom
+                    st.session_state['ho_segments_df'] = upd
+                    st.session_state['ho_editor_version'] = (
+                        st.session_state.get('ho_editor_version', 0) + 1
+                    )
+
+            edited_df = st.data_editor(
+                st.session_state['ho_segments_df'],
+                column_config={
+                    'selected': st.column_config.CheckboxColumn('✓', default=False),
+                    'segment_id': st.column_config.NumberColumn('ID', disabled=True),
+                    'ten_duong': st.column_config.TextColumn('Road', disabled=True),
+                    'doan': st.column_config.TextColumn('Segment', disabled=True),
+                    'vt1': st.column_config.NumberColumn('VT1 Price', disabled=True),
+                    'nhom': st.column_config.SelectboxColumn(
+                        'Nhom', options=['A', 'B', 'C'], required=True
+                    ),
+                    'nhom_manual': st.column_config.CheckboxColumn('Manual?', disabled=True),
+                },
+                use_container_width=True,
+                hide_index=True,
+                key=f'ho_editor_{st.session_state.get("ho_editor_version", 0)}',
+            )
+            # Mirror only — do NOT overwrite the stable base used by data_editor
+            st.session_state['ho_segments_edited'] = edited_df
+
+            if st.button('Save Changes'):
+                original = st.session_state['ho_segments_original']
+
+                def _nhom(v):
+                    return '' if pd.isna(v) or str(v).strip() == '' else str(v).strip().upper()
+
+                changed_mask = edited_df['nhom'].apply(_nhom) != original['nhom'].apply(_nhom)
+                changed_df = edited_df[changed_mask]
+
+                updated = 0
+                if not changed_df.empty:
+                    changed_ids = changed_df['segment_id'].astype(int).tolist()
+                    nhom_by_id = {
+                        int(r['segment_id']): _nhom(r['nhom'])
+                        for _, r in changed_df.iterrows()
+                        if _nhom(r['nhom'])
+                    }
+                    from datetime import datetime
+                    with svc['repo'].session_scope() as session:
+                        from src.models.eform_models import Segment
+                        segs = session.query(Segment).filter(
+                            Segment.id.in_(changed_ids)
+                        ).all()
+                        for seg in segs:
+                            new_nhom = nhom_by_id.get(seg.id)
+                            if new_nhom:
+                                seg.nhom = new_nhom
+                                seg.nhom_manual = True
+                                seg.updated_at = datetime.utcnow()
+                                updated += 1
+
+                    saved_ids = set(nhom_by_id.keys())
+                    refreshed = st.session_state.get('ho_segments_edited', st.session_state['ho_segments_df']).copy()
+                    refreshed.loc[refreshed['segment_id'].isin(saved_ids), 'nhom_manual'] = True
+                    st.session_state['ho_segments_df'] = refreshed
+                    st.session_state['ho_segments_original'] = refreshed.copy()
+                    st.session_state['ho_editor_version'] = (
+                        st.session_state.get('ho_editor_version', 0) + 1
+                    )
+
+                st.success(f'Saved — {updated} segment{"s" if updated != 1 else ""} updated.')
+
+    # ── Excel export ──────────────────────────────────────────────────────────
+    st.divider()
+    if st.button('Export HO Review Excel'):
+        import pandas as pd
+        from io import BytesIO
+        from src.utils.text import normalize
+        with svc['repo'].session_scope() as session:
+            from src.models.eform_models import Segment
+            q = session.query(Segment).filter_by(is_active=True)
+            if ho_selected_province:
+                q = q.filter(Segment.tinh_thanh_norm == normalize(ho_selected_province))
+            if ho_selected_ward:
+                q = q.filter(Segment.xa_phuong_norm == normalize(ho_selected_ward))
+            segs = q.all()
+            rows = [{
+                'segment_id': s.id, 'tinh_thanh': s.tinh_thanh,
+                'xa_phuong': s.xa_phuong, 'ten_duong': s.ten_duong,
+                'doan': s.doan or '', 'nhom': s.nhom or '',
+                'vt1': s.vt1, 'nhom_manual': s.nhom_manual,
+            } for s in segs]
+        df_exp = pd.DataFrame(rows)
+        buf = BytesIO()
+        df_exp.to_excel(buf, index=False)
+        st.session_state['ho_review_export'] = buf.getvalue()
+    if st.session_state.get('ho_review_export'):
+        st.download_button('Download', st.session_state['ho_review_export'], 'ho_review.xlsx')
 
 # ── Page 3: Branch Mapping ────────────────────────────────────────────────────
 

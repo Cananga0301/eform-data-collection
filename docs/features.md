@@ -18,7 +18,7 @@ This app is the management backend for the e-form road-data collection process a
 The end-to-end workflow is:
 
 1. Import route files and classify segments.
-2. Export the HO review file and re-import manual group overrides.
+2. Review and manually adjust segment groups (A/B/C) in the HO Review page using the in-page editor.
 3. Maintain branch mappings and export assignment files.
 4. Re-import assignment ownership and deadlines.
 5. Run sync from the external collection system.
@@ -80,12 +80,7 @@ If a segment has already been manually overridden by HO, the importer preserves 
 
 ### HO review
 
-The Streamlit app supports an HO review round-trip:
-
-- export a review Excel file with `segment_id` and editable `nhom`
-- edit the group externally
-- re-import the file
-- changed rows are marked manual so later imports do not overwrite them
+HO can review and override segment group assignments directly in the app without touching any Excel file. Manually set values are flagged with `nhom_manual = true` so later master-file re-imports do not overwrite them. An Excel export of the current filtered view is available for offline reference.
 
 ### Current import performance
 
@@ -123,6 +118,73 @@ On master Excel re-import:
 - assignments are not reset by the importer
 - rows missing from the new master file are marked `is_active = false`
 - previously inactive rows are reactivated if they appear again later
+
+## HO Review / Group Override
+
+### What it does
+
+This page lets Head Office staff review and manually assign the A/B/C group for any segment, filtered to a specific province and ward/zone.
+
+### Workflow
+
+1. Select a province from the province dropdown.
+2. Select a ward/zone from the ward dropdown (populated from the selected province).
+3. Click **Load Segments** — the table shows all active segments for that province/ward pair.
+4. Edit the **Nhom** column inline for any row (A, B, or C).
+5. Use the **Select all** / **Deselect all** buttons to tick rows in bulk.
+6. Use the **Set all selected rows to:** dropdown and **Apply to selected** button to apply one group value to all ticked rows.
+7. Click **Save Changes** to persist to the database. Changed rows are marked `nhom_manual = true`.
+
+### Table columns
+
+| Column | Description |
+|--------|-------------|
+| ✓ | Row selection checkbox for bulk apply |
+| ID | Internal segment ID (read-only) |
+| Road | Street name (read-only) |
+| Segment | Segment descriptor (read-only) |
+| VT1 Price | State land price for position 1 (read-only) |
+| Nhom | A/B/C group — editable inline |
+| Manual? | True if this row was previously saved manually (read-only) |
+
+Province and ward are not shown as columns because they are already chosen by the filter.
+
+### Export HO Review Excel
+
+A separate **Export HO Review Excel** button (below the table) exports all active segments matching the current province/ward filter to an Excel file. The export includes segment ID, province, ward, road, segment, nhom, VT1, and the manual flag. This file is for offline reference only; changes to it are not re-imported.
+
+---
+
+## Branch Mapping
+
+### What it does
+
+Branch Mapping defines which branch is responsible for collecting each segment. It operates on two levels:
+
+- **Province level (`tinh_thanh`)**: assigns a branch to all segments in a province that do not have a ward-level override
+- **Ward level (`xa_phuong`)**: assigns a branch to all segments in a specific ward, taking priority over the province rule
+
+### Adding a branch
+
+Type a name in the **New branch name** field and submit. A new branch is created immediately.
+
+### Adding a mapping
+
+1. Choose the **Key type** — `xa_phuong` (ward) or `tinh_thanh` (province).
+2. Choose the **Key value** from the dropdown — the list shows all known wards or provinces from imported segments.
+3. Choose the **Map to branch** from the branch dropdown.
+4. Click **Save Mapping**.
+
+### What happens on Save
+
+Saving a mapping does two things:
+
+1. Writes the mapping rule to the database.
+2. Immediately applies the rule to all currently active matching segments whose `branch_id` is null or different — so existing imported data is updated without requiring a re-import. The confirmation message shows how many segments were affected.
+
+Ward-level mappings always take priority over province-level mappings when both could apply to the same segment.
+
+---
 
 ## T2 - Assignment Files
 
@@ -256,6 +318,7 @@ The report generator creates a 3-sheet Excel file:
 
 The Streamlit "Progress Dashboard" page now includes:
 
+- province and ward/zone filter dropdowns (the metrics and tables below all respond to the selected filter)
 - the 4 top metrics
 - a separate card for `Số đoạn đường chưa bắt đầu`
 - a separate card for `Số đoạn đường đang thu thập`
@@ -377,7 +440,10 @@ The current app defines 9 Streamlit pages:
 1. **Import & Classify**
    - upload route Excel files and run the importer
 2. **HO Review / Group Override**
-   - export and re-import manual group edits
+   - filter by province and ward/zone
+   - edit segment groups (A/B/C) in-page with checkbox row selection and bulk apply
+   - save changes directly to the database; changed rows are flagged as manual overrides
+   - export the current filtered view to Excel for offline reference
 3. **Branch Mapping**
    - create branches and add mapping rules
 4. **Assignment Export / Import**
@@ -445,7 +511,7 @@ At a high level:
 - The real external collection API client is not implemented yet; sync currently uses a stub client.
 - The Flask API surface is minimal and not a full backend API yet.
 - The Streamlit dashboard page is lighter than the reporting service behind it.
-- The Branch Mapping page is still basic; it supports adding branches and mappings, but not a full polished admin experience.
+- The Branch Mapping page supports adding branches and mapping rules with automatic segment assignment on save, but does not yet support editing or deleting existing mappings from the UI.
 - Some planned verification/completion behavior is not yet fully wired end-to-end from sync through automatic completion.
 - The sync cursor stores both timestamp and record ID, but the boundary-handling logic is still not fully robust for same-timestamp edge cases.
 
