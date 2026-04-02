@@ -28,7 +28,10 @@ class SyncerService:
         self.repo = repository
         self.client = client
 
-    def run(self):
+    def run(self) -> set[int]:
+        """Run an incremental sync. Returns the set of segment IDs whose status was recalculated."""
+        affected_ids: set[int] = set()
+
         with self.repo.session_scope() as session:
             cursor = self.repo.get_or_create_sync_cursor(session)
             since = cursor.last_synced_at or datetime(2000, 1, 1, tzinfo=timezone.utc)
@@ -55,7 +58,7 @@ class SyncerService:
 
                 for raw in records:
                     total_received += 1
-                    mapped = self._process_record(session, raw, sync_log.id)
+                    mapped = self._process_record(session, raw, sync_log.id, affected_ids)
                     if mapped:
                         total_mapped += 1
                     else:
@@ -89,13 +92,17 @@ class SyncerService:
                 cursor.updated_at = datetime.now(timezone.utc)
 
             logger.info(
-                f"Sync complete: received={total_received} mapped={total_mapped} unmapped={total_unmapped}"
+                f"Sync complete: received={total_received} mapped={total_mapped} "
+                f"unmapped={total_unmapped} affected_segments={len(affected_ids)}"
             )
 
-    def replay_unmapped(self, session, unmapped_id: int, chosen_segment_id: int):
+        return affected_ids
+
+    def replay_unmapped(self, session, unmapped_id: int, chosen_segment_id: int) -> int | None:
         """
         Resolve an unmapped record by assigning it to the chosen segment.
         Idempotent: if source_record_id is already in collected_records, UPDATE that row.
+        Returns the segment ID whose status was recalculated, or None if segment not found.
         """
         from src.models.eform_models import UnmappedRecord
         unmapped = session.query(UnmappedRecord).filter_by(id=unmapped_id).first()
@@ -128,11 +135,13 @@ class SyncerService:
         segment = self.repo.get_segment_by_id(session, chosen_segment_id)
         if segment:
             self._recalculate_status(session, segment)
+            return chosen_segment_id
+        return None
 
     # ── Private ───────────────────────────────────────────────────────────────
 
-    def _process_record(self, session, raw: dict, sync_log_id: int) -> bool:
-        """Returns True if the record was mapped to a segment."""
+    def _process_record(self, session, raw: dict, sync_log_id: int, affected_ids: set) -> bool:
+        """Returns True if the record was mapped to a segment. Adds touched segment IDs to affected_ids."""
         source_id = raw.get('id')
         now = datetime.now(timezone.utc)
 
@@ -143,6 +152,7 @@ class SyncerService:
                 cr.is_active = False
                 cr.last_synced_at = now
                 if cr.segment_id:
+                    affected_ids.add(cr.segment_id)
                     self._recalculate_status(session, self.repo.get_segment_by_id(session, cr.segment_id))
             return bool(cr and cr.segment_id)
 
@@ -158,6 +168,7 @@ class SyncerService:
 
             if segment:
                 existing_cr.segment_id = segment.id
+                affected_ids.add(segment.id)
                 self._recalculate_status(session, segment)
             else:
                 existing_cr.segment_id = None  # clear stale mapping
@@ -177,6 +188,7 @@ class SyncerService:
             if old_segment_id and old_segment_id != (segment.id if segment else None):
                 old_seg = self.repo.get_segment_by_id(session, old_segment_id)
                 if old_seg:
+                    affected_ids.add(old_segment_id)
                     self._recalculate_status(session, old_seg)
 
             return segment is not None
@@ -205,6 +217,7 @@ class SyncerService:
                 session.add(unmapped)
                 return False
 
+            affected_ids.add(segment.id)
             self._recalculate_status(session, segment)
             return True
 

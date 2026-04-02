@@ -26,7 +26,7 @@ from src.service.assigner_service import AssignerService
 from src.service.syncer_service import SyncerService
 from src.service.reporter_service import ReporterService
 from src.service.verifier_service import VerifierService
-from src.clients.collection_client import StubCollectionClient
+from src.clients.collection_client import StubCollectionClient, FileCollectionClient
 
 # ── Shared setup ──────────────────────────────────────────────────────────────
 
@@ -132,7 +132,7 @@ elif page == 'HO Review / Group Override':
     both_selected = ho_selected_province is not None and ho_selected_ward is not None
     with f_col3:
         load_clicked = st.button(
-            'Load Segments', use_container_width=True, disabled=not both_selected
+            'Load Segments', width='stretch', disabled=not both_selected
         )
     if not both_selected:
         st.caption('Select both a province and a ward / zone to load segments.')
@@ -184,7 +184,7 @@ elif page == 'HO Review / Group Override':
             with ctrl_col1:
                 sa_c1, sa_c2 = st.columns(2)
                 with sa_c1:
-                    if st.button('Select all', use_container_width=True):
+                    if st.button('Select all', width='stretch'):
                         upd = st.session_state.get('ho_segments_edited', st.session_state['ho_segments_df']).copy()
                         upd['selected'] = True
                         st.session_state['ho_segments_df'] = upd
@@ -192,7 +192,7 @@ elif page == 'HO Review / Group Override':
                             st.session_state.get('ho_editor_version', 0) + 1
                         )
                 with sa_c2:
-                    if st.button('Deselect all', use_container_width=True):
+                    if st.button('Deselect all', width='stretch'):
                         upd = st.session_state.get('ho_segments_edited', st.session_state['ho_segments_df']).copy()
                         upd['selected'] = False
                         st.session_state['ho_segments_df'] = upd
@@ -205,7 +205,7 @@ elif page == 'HO Review / Group Override':
                     key='ho_bulk_nhom',
                 )
             with ctrl_col3:
-                if st.button('Apply to selected', use_container_width=True) and bulk_nhom != '(no change)':
+                if st.button('Apply to selected', width='stretch') and bulk_nhom != '(no change)':
                     upd = st.session_state.get('ho_segments_edited', st.session_state['ho_segments_df']).copy()
                     mask = upd['selected'].fillna(False).astype(bool)
                     upd.loc[mask, 'nhom'] = bulk_nhom
@@ -227,7 +227,7 @@ elif page == 'HO Review / Group Override':
                     ),
                     'nhom_manual': st.column_config.CheckboxColumn('Manual?', disabled=True),
                 },
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
                 key=f'ho_editor_{st.session_state.get("ho_editor_version", 0)}',
             )
@@ -431,9 +431,22 @@ elif page == 'Sync Status':
         st.write(f"Last run: received={last_log.total_received}  "
                  f"mapped={last_log.total_mapped}  unmapped={last_log.total_unmapped}")
 
+    use_fixture = st.checkbox('Use test fixture (test_collected_records.json)')
+
     if st.button('Run Sync Now'):
+        if use_fixture:
+            syncer_to_run = SyncerService(
+                svc['repo'],
+                FileCollectionClient(
+                    r'C:\Users\phukt\gathering_data\eform-data-collection\test_collected_records.json'
+                ),
+            )
+        else:
+            syncer_to_run = svc['syncer']
         with st.spinner('Syncing...'):
-            svc['syncer'].run()
+            affected_ids = syncer_to_run.run()
+            if affected_ids:
+                svc['verifier'].run_auto_checks(nguoi_kiem_tra='system', segment_ids=affected_ids)
         st.success('Sync complete.')
         st.rerun()
 
@@ -475,9 +488,12 @@ elif page == 'Progress Dashboard':
     col3.metric('% Complete', f"{metrics['pct_complete']}%")
     col4.metric('ETA', metrics['eta'])
 
-    extra_col1, extra_col2 = st.columns(2)
-    extra_col1.metric('Số đoạn đường chưa bắt đầu', status_counts['not_started'])
-    extra_col2.metric('Số đoạn đường đang thu thập', status_counts['in_progress'])
+    sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+    sc1.metric('Số đoạn đường chưa bắt đầu',  status_counts['not_started'])
+    sc2.metric('Số đoạn đường đang thu thập',  status_counts['in_progress'])
+    sc3.metric('Số đoạn đường đủ vị trí',      status_counts['enough_positions'])
+    sc4.metric('Số đoạn đường dữ liệu lỗi',   status_counts['error'])
+    sc5.metric('Số đoạn đường đã hoàn thành', status_counts['completed'])
 
     st.progress(min(max(metrics['pct_complete'] / 100, 0.0), 1.0))
 
@@ -486,7 +502,7 @@ elif page == 'Progress Dashboard':
     if overview_df.empty:
         st.info('No grouped progress data for the current filter.')
     else:
-        st.dataframe(overview_df, use_container_width=True, hide_index=True)
+        st.dataframe(overview_df, width='stretch', hide_index=True)
 
     st.subheader('Branch Activity')
     st.caption(f"Branches with no new records in the last {dashboard['recent_days']} days are flagged.")
@@ -494,14 +510,139 @@ elif page == 'Progress Dashboard':
     if branch_df.empty:
         st.info('No branch activity rows for the current filter.')
     else:
-        st.dataframe(branch_df, use_container_width=True, hide_index=True)
+        st.dataframe(branch_df, width='stretch', hide_index=True)
 
     st.subheader('White Zones')
     white_zone_df = pd.DataFrame(dashboard['white_zones'])
     if white_zone_df.empty:
         st.success('No A/B white zones in the current filter.')
     else:
-        st.dataframe(white_zone_df, use_container_width=True, hide_index=True)
+        st.dataframe(white_zone_df, width='stretch', hide_index=True)
+
+    st.subheader('Segment Record Detail')
+
+    # ── Own Province → Ward → Segment cascade (independent of main filters) ───
+    with svc['repo'].session_scope() as session:
+        _detail_province_opts = svc['repo'].get_distinct_tinh_thanh(session)
+    _detail_province_choice = st.selectbox(
+        'Province',
+        options=['All provinces'] + _detail_province_opts,
+        key='detail_province',
+    )
+    _detail_selected_province = None if _detail_province_choice == 'All provinces' else _detail_province_choice
+
+    with svc['repo'].session_scope() as session:
+        _detail_ward_opts = svc['repo'].get_distinct_xa_phuong(
+            session, tinh_thanh=_detail_selected_province
+        )
+    _detail_ward_choice = st.selectbox(
+        'Ward / Zone',
+        options=['All wards'] + _detail_ward_opts,
+        key='detail_ward',
+    )
+    _detail_selected_ward = None if _detail_ward_choice == 'All wards' else _detail_ward_choice
+
+    with svc['repo'].session_scope() as session:
+        from src.models.eform_models import Segment as _Seg
+        from src.utils.text import normalize as _norm
+        _q = session.query(_Seg).filter(_Seg.is_active == True)
+        if _detail_selected_province:
+            _q = _q.filter(_Seg.tinh_thanh_norm == _norm(_detail_selected_province))
+        if _detail_selected_ward:
+            _q = _q.filter(_Seg.xa_phuong_norm == _norm(_detail_selected_ward))
+        _detail_segs = [
+            {
+                'id':         seg.id,
+                'tinh_thanh': seg.tinh_thanh or '',
+                'xa_phuong':  seg.xa_phuong or '',
+                'label':      (seg.ten_duong or '') + (' / ' + seg.doan if seg.doan else ''),
+                'trang_thai': seg.trang_thai,
+                # Only include positions that are actually required for this segment.
+                'so_can': {
+                    vt: cnt for vt, cnt in {
+                        1: seg.so_can_vt1,
+                        2: seg.so_can_vt2,
+                        3: seg.so_can_vt3,
+                        4: seg.so_can_vt4,
+                    }.items() if cnt
+                },
+            }
+            for seg in _q.order_by(_Seg.ten_duong, _Seg.doan).all()
+        ]
+
+    if not _detail_segs:
+        st.info('No segments match the current province / ward filter.')
+    else:
+        # Use segment id as the select value to avoid label collisions.
+        _id_to_seg   = {s['id']: s for s in _detail_segs}
+        _seg_options = [s['id'] for s in _detail_segs]
+
+        def _fmt_seg(seg_id: int) -> str:
+            """Prefix ward (and province) only when the corresponding filter is
+            set to 'All', so labels are always unambiguous."""
+            s = _id_to_seg[seg_id]
+            parts: list[str] = []
+            if not _detail_selected_province:
+                parts.append(s['tinh_thanh'])
+            if not _detail_selected_ward:
+                parts.append(s['xa_phuong'])
+            parts.append(s['label'])
+            return ' — '.join(p for p in parts if p)
+
+        _chosen_id = st.selectbox(
+            'Segment', options=_seg_options, format_func=_fmt_seg, key='detail_seg'
+        )
+        _chosen = _id_to_seg[_chosen_id]
+
+        # ── Fetch records ──────────────────────────────────────────────────────
+        with svc['repo'].session_scope() as session:
+            _records = svc['repo'].get_collected_records_for_segment(session, _chosen_id)
+
+        _active   = [r for r in _records if     r['is_active']]
+        _inactive = [r for r in _records if not r['is_active']]
+        _so_can   = _chosen['so_can']                         # {1: 3, 2: 3, ...}
+        _needed   = sum(_so_can.values())                     # total required
+
+        # Per-position active counts — keyed by vi_tri int
+        _vt_active: dict[int, int] = {}
+        for r in _active:
+            vt = r['vi_tri']
+            _vt_active[vt] = _vt_active.get(vt, 0) + 1
+
+        # Còn thiếu = sum of per-position deficits (correct, not total-row based)
+        _con_thieu = sum(
+            max(0, need - _vt_active.get(vt, 0))
+            for vt, need in _so_can.items()
+        )
+
+        # ── Summary metrics ────────────────────────────────────────────────────
+        dc1, dc2, dc3, dc4 = st.columns(4)
+        dc1.metric('Trạng thái',   _chosen['trang_thai'])
+        dc2.metric('Cần thu thập', _needed)
+        dc3.metric('Đã thu thập',  len(_active))
+        dc4.metric('Còn thiếu',    _con_thieu)
+
+        # ── Per-position breakdown (all required positions, even zero-count) ───
+        if _so_can:
+            _vt_parts = [
+                f"vt{vt}: {_vt_active.get(vt, 0)}/{need}"
+                for vt, need in sorted(_so_can.items())
+            ]
+            st.caption('Số lượng theo vị trí — ' + '  |  '.join(_vt_parts))
+        if _inactive:
+            st.caption(f"⚠ {len(_inactive)} bản ghi đã bị xoá mềm (không tính vào Đã thu thập)")
+
+        # ── Records table + raw data ───────────────────────────────────────────
+        if _records:
+            _tbl = [{k: v for k, v in r.items() if k != 'raw_data'} for r in _records]
+            st.dataframe(pd.DataFrame(_tbl), width='stretch', hide_index=True)
+            with st.expander('Raw data (JSON)'):
+                for r in _records:
+                    _del_tag = ' *(deleted)*' if not r['is_active'] else ''
+                    st.markdown(f"**{r['source_record_id']}**{_del_tag}")
+                    st.json(r['raw_data'])
+        else:
+            st.info('Chưa có bản ghi nào cho đoạn đường này.')
 
     st.subheader('Export Current View')
     if st.button('Prepare Dashboard Export'):
@@ -522,28 +663,97 @@ elif page == 'Progress Dashboard':
 elif page == 'Unmapped Records':
     st.header('Unmapped Records')
 
+    # Fetch unmapped records as dicts to avoid detached-instance issues.
     with svc['repo'].session_scope() as session:
-        unmapped = svc['repo'].get_unresolved_unmapped(session)
-        from src.models.eform_models import Segment
-        active_segs = session.query(Segment).filter_by(is_active=True).order_by(Segment.ten_duong).all()
-        seg_options = {s.id: f"[{s.id}] {s.tinh_thanh} / {s.xa_phuong} / {s.ten_duong} {s.doan or ''}" for s in active_segs}
+        _p7_unmapped = [
+            {
+                'id':               u.id,
+                'source_record_id': u.source_record_id,
+                'reason':           u.reason,
+                'raw_data':         u.raw_data or {},
+            }
+            for u in svc['repo'].get_unresolved_unmapped(session)
+        ]
 
-    if not unmapped:
+    if not _p7_unmapped:
         st.info('No unresolved records.')
     else:
-        st.write(f'{len(unmapped)} unresolved record(s).')
-        for u in unmapped:
-            with st.expander(f'Record {u.id} — source: {u.source_record_id}'):
-                st.write(f'**Reason:** {u.reason}')
-                st.json(u.raw_data or {})
-                chosen = st.selectbox('Assign to segment', list(seg_options.keys()),
-                                      format_func=lambda x: seg_options[x],
-                                      key=f'seg_{u.id}')
-                if st.button('Resolve', key=f'resolve_{u.id}'):
-                    with svc['repo'].session_scope() as session:
-                        svc['syncer'].replay_unmapped(session, u.id, chosen)
-                    st.success('Resolved.')
-                    st.rerun()
+        st.write(f'{len(_p7_unmapped)} unresolved record(s).')
+
+        # Province list is the same for every record — fetch once.
+        with svc['repo'].session_scope() as session:
+            _p7_province_opts = svc['repo'].get_distinct_tinh_thanh(session)
+
+        # Flash message from previous resolve action — st.success() before
+        # st.rerun() is never seen, so the message is stored in session state.
+        if st.session_state.get('p7_resolved'):
+            st.success(st.session_state['p7_resolved'])
+            del st.session_state['p7_resolved']
+
+        # ── Unmapped record list ───────────────────────────────────────────────
+        for u in _p7_unmapped:
+            _uid = u['id']
+            with st.expander(f"Record {_uid} — source: {u['source_record_id']}"):
+                st.write(f"**Reason:** {u['reason']}")
+                st.json(u['raw_data'])
+
+                # Province → Ward → Segment cascade, independent per record.
+                _p7_prov_choice = st.selectbox(
+                    'Province',
+                    options=['All provinces'] + _p7_province_opts,
+                    key=f'p7_province_{_uid}',
+                )
+                _p7_sel_prov = None if _p7_prov_choice == 'All provinces' else _p7_prov_choice
+
+                with svc['repo'].session_scope() as session:
+                    _p7_ward_opts = svc['repo'].get_distinct_xa_phuong(
+                        session, tinh_thanh=_p7_sel_prov
+                    )
+                _p7_ward_choice = st.selectbox(
+                    'Ward / Zone',
+                    options=['All wards'] + _p7_ward_opts,
+                    key=f'p7_ward_{_uid}',
+                )
+                _p7_sel_ward = None if _p7_ward_choice == 'All wards' else _p7_ward_choice
+
+                with svc['repo'].session_scope() as session:
+                    from src.models.eform_models import Segment as _P7Seg
+                    from src.utils.text import normalize as _p7_norm
+                    _p7_q = session.query(_P7Seg).filter(_P7Seg.is_active == True)
+                    if _p7_sel_prov:
+                        _p7_q = _p7_q.filter(_P7Seg.tinh_thanh_norm == _p7_norm(_p7_sel_prov))
+                    if _p7_sel_ward:
+                        _p7_q = _p7_q.filter(_P7Seg.xa_phuong_norm == _p7_norm(_p7_sel_ward))
+                    _p7_seg_opts = {
+                        s.id: (
+                            (f"{s.tinh_thanh} / " if not _p7_sel_prov else '')
+                            + (f"{s.xa_phuong} / " if not _p7_sel_ward else '')
+                            + f"{s.ten_duong or ''}"
+                            + (f" / {s.doan}" if s.doan else '')
+                        ).strip(' /')
+                        for s in _p7_q.order_by(_P7Seg.ten_duong, _P7Seg.doan).all()
+                    }
+
+                if not _p7_seg_opts:
+                    st.warning('No segments found for the selected province / ward.')
+                else:
+                    chosen = st.selectbox(
+                        'Assign to segment',
+                        options=list(_p7_seg_opts.keys()),
+                        format_func=lambda x: _p7_seg_opts[x],
+                        key=f'seg_{_uid}',
+                    )
+                    if st.button('Resolve', key=f'resolve_{_uid}'):
+                        with svc['repo'].session_scope() as session:
+                            affected_id = svc['syncer'].replay_unmapped(session, _uid, chosen)
+                        if affected_id:
+                            svc['verifier'].run_auto_checks(
+                                nguoi_kiem_tra='system', segment_ids={affected_id}
+                            )
+                        st.session_state['p7_resolved'] = (
+                            f"Record {u['source_record_id']} resolved successfully."
+                        )
+                        st.rerun()
 
 # ── Page 8: Reports ───────────────────────────────────────────────────────────
 
@@ -560,24 +770,171 @@ elif page == 'Reports':
 elif page == 'Verification':
     st.header('Verification')
 
-    inspector = st.text_input('Inspector name', 'system')
-    if st.button('Run Auto-Checks'):
+    # ── Section A: Inspector name ─────────────────────────────────────────────
+    inspector = st.text_input('Inspector name', value='', key='vf_inspector')
+    inspector_valid = bool(inspector.strip())
+    if st.session_state.pop('vf_flash', None):
+        st.success(st.session_state.pop('vf_flash_msg', ''))
+
+    st.divider()
+
+    # ── Section B: Auto-checks (requires inspector name) ─────────────────────
+    st.subheader('Auto-Checks')
+    if not inspector_valid:
+        st.caption('Enter inspector name above to run auto-checks.')
+    if st.button('Run Auto-Checks', disabled=not inspector_valid):
         with st.spinner('Running checks...'):
-            result = svc['verifier'].run_auto_checks(nguoi_kiem_tra=inspector)
+            result = svc['verifier'].run_auto_checks(nguoi_kiem_tra=inspector.strip())
         st.success(f"Passed: {result['passed']}  Failed: {result['failed']}")
 
-    st.subheader('Verification Log')
+    st.divider()
+
+    # ── Section C: Manual review ──────────────────────────────────────────────
+    st.subheader('Manual Review')
+    from src.models.eform_models import Segment as _VFSeg, VerificationLog
+    from src.utils.text import normalize as _vf_norm
+
     with svc['repo'].session_scope() as session:
-        from src.models.eform_models import VerificationLog
-        logs = session.query(VerificationLog).order_by(VerificationLog.verified_at.desc()).limit(200).all()
-        rows = [{
+        _vf_province_opts = svc['repo'].get_distinct_tinh_thanh(session)
+    _vf_prov = st.selectbox('Province', ['All provinces'] + _vf_province_opts, key='vf_prov')
+    _vf_sel_prov = None if _vf_prov == 'All provinces' else _vf_prov
+
+    with svc['repo'].session_scope() as session:
+        _vf_ward_opts = svc['repo'].get_distinct_xa_phuong(session, tinh_thanh=_vf_sel_prov)
+    _vf_ward = st.selectbox('Ward / Zone', ['All wards'] + _vf_ward_opts, key='vf_ward')
+    _vf_sel_ward = None if _vf_ward == 'All wards' else _vf_ward
+
+    with svc['repo'].session_scope() as session:
+        _vf_q = session.query(_VFSeg).filter(
+            _VFSeg.is_active == True,
+            _VFSeg.trang_thai.in_(['Đủ vị trí', 'Hoàn thành', 'Dữ liệu sai hoặc lỗi'])
+        )
+        if _vf_sel_prov:
+            _vf_q = _vf_q.filter(_VFSeg.tinh_thanh_norm == _vf_norm(_vf_sel_prov))
+        if _vf_sel_ward:
+            _vf_q = _vf_q.filter(_VFSeg.xa_phuong_norm == _vf_norm(_vf_sel_ward))
+        _vf_segs = _vf_q.order_by(_VFSeg.ten_duong, _VFSeg.doan).all()
+        _vf_seg_opts = {
+            s.id: (
+                (f"{s.tinh_thanh} / " if not _vf_sel_prov else '')
+                + (f"{s.xa_phuong} / " if not _vf_sel_ward else '')
+                + f"{s.ten_duong or ''}"
+                + (f" / {s.doan}" if s.doan else '')
+                + f"  ({s.trang_thai})"
+            ).strip(' /')
+            for s in _vf_segs
+        }
+
+    if not _vf_seg_opts:
+        st.info('No reviewable segments in this filter.')
+    else:
+        _vf_chosen_id = st.selectbox(
+            'Segment', options=list(_vf_seg_opts.keys()),
+            format_func=lambda x: _vf_seg_opts[x], key='vf_seg'
+        )
+
+        with svc['repo'].session_scope() as session:
+            _vf_seg = svc['repo'].get_segment_by_id(session, _vf_chosen_id)
+            _vf_records = svc['repo'].get_collected_records_for_segment(session, _vf_chosen_id)
+            _vf_so_can = {
+                vt: req for vt, req in [
+                    (1, _vf_seg.so_can_vt1), (2, _vf_seg.so_can_vt2),
+                    (3, _vf_seg.so_can_vt3), (4, _vf_seg.so_can_vt4),
+                ] if req is not None
+            }
+
+        _vf_active = [r for r in _vf_records if r['is_active']]
+        _vf_inactive = [r for r in _vf_records if not r['is_active']]
+
+        _vf_vt_active: dict[int, int] = {}
+        for r in _vf_active:
+            vt = r['vi_tri']
+            _vf_vt_active[vt] = _vf_vt_active.get(vt, 0) + 1
+        _vf_con_thieu = sum(
+            max(0, need - _vf_vt_active.get(vt, 0))
+            for vt, need in _vf_so_can.items()
+        )
+
+        vc1, vc2, vc3, vc4 = st.columns(4)
+        vc1.metric('Active', len(_vf_active))
+        vc2.metric('Soft-deleted', len(_vf_inactive))
+        vc3.metric('Still needed', _vf_con_thieu)
+        vc4.metric('Total', len(_vf_records))
+
+        if _vf_so_can:
+            _vf_parts = [
+                f"vt{vt}: {_vf_vt_active.get(vt, 0)}/{need}"
+                for vt, need in sorted(_vf_so_can.items())
+            ]
+            st.caption('Số lượng theo vị trí — ' + '  |  '.join(_vf_parts))
+        if _vf_inactive:
+            st.caption(f"⚠ {len(_vf_inactive)} record(s) soft-deleted (not counted)")
+
+        if _vf_records:
+            import pandas as pd
+            _vf_tbl = [{k: v for k, v in r.items() if k != 'raw_data'} for r in _vf_records]
+            st.dataframe(pd.DataFrame(_vf_tbl), hide_index=True)
+            with st.expander('Raw data (JSON)'):
+                for r in _vf_records:
+                    _vf_del_tag = ' *(deleted)*' if not r['is_active'] else ''
+                    st.markdown(f"**{r['source_record_id']}**{_vf_del_tag}")
+                    st.json(r['raw_data'])
+        else:
+            st.info('No records for this segment.')
+
+        _vf_outcome = st.radio(
+            'Review outcome',
+            ['pass — Hoàn thành', 'fail — Dữ liệu sai hoặc lỗi'],
+            key='vf_outcome', horizontal=True,
+        )
+        _vf_outcome_key = 'pass' if _vf_outcome.startswith('pass') else 'fail'
+        _vf_notes = st.text_area(
+            'Notes' + (' (required for fail)' if _vf_outcome_key == 'fail' else ''),
+            key='vf_notes', height=80,
+        )
+
+        if not inspector_valid:
+            st.caption('Enter inspector name above before saving.')
+        if st.button('Save Review', disabled=not inspector_valid):
+            try:
+                svc['verifier'].save_manual_finding(
+                    segment_id=_vf_chosen_id,
+                    nguoi_kiem_tra=inspector.strip(),
+                    finding_text=_vf_notes,
+                    outcome=_vf_outcome_key,
+                )
+                st.session_state['vf_flash'] = True
+                st.session_state['vf_flash_msg'] = (
+                    f"Review saved for segment {_vf_chosen_id} — {_vf_outcome_key.upper()}."
+                )
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+
+    st.divider()
+
+    # ── Section D: Verification log ───────────────────────────────────────────
+    st.subheader('Verification Log')
+    _vf_log_filter = st.radio(
+        'Show', ['All', 'auto only', 'manual only'], horizontal=True, key='vf_log_filter'
+    )
+    with svc['repo'].session_scope() as session:
+        _vf_lq = session.query(VerificationLog).order_by(VerificationLog.verified_at.desc())
+        if _vf_log_filter == 'auto only':
+            _vf_lq = _vf_lq.filter(VerificationLog.loai_kiem_tra == 'auto')
+        elif _vf_log_filter == 'manual only':
+            _vf_lq = _vf_lq.filter(VerificationLog.loai_kiem_tra == 'manual')
+        _vf_logs = _vf_lq.limit(200).all()
+        _vf_rows = [{
+            'id': l.id,
             'segment_id': l.segment_id,
+            'type': l.loai_kiem_tra,
             'inspector': l.nguoi_kiem_tra,
             'result': l.ket_qua,
             'at': str(l.verified_at),
-        } for l in logs]
-    if rows:
+        } for l in _vf_logs]
+    if _vf_rows:
         import pandas as pd
-        st.dataframe(pd.DataFrame(rows))
+        st.dataframe(pd.DataFrame(_vf_rows))
     else:
         st.info('No verification records yet.')

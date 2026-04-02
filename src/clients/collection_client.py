@@ -6,7 +6,7 @@ until the API team delivers their spec. To integrate the real API, subclass
 AbstractCollectionClient and swap it in container.py.
 """
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class AbstractCollectionClient(ABC):
@@ -63,3 +63,60 @@ class StubCollectionClient(AbstractCollectionClient):
         last_record_id: str = None,
     ) -> dict:
         return {'records': [], 'has_next': False}
+
+
+class FileCollectionClient(AbstractCollectionClient):
+    """
+    Serves records from a local JSON file for local testing.
+
+    The file must be a JSON array of record dicts in the fetch_records format
+    (required fields: id, tinh_thanh, xa_phuong, ten_duong, doan, vi_tri,
+    updated_at, is_deleted). Records are re-sorted at load time by effective
+    timestamp then id to match the cursor ordering the syncer expects.
+
+    Usage (Streamlit Page 5):
+        Type the file path in the fixture input, then click Run Sync Now.
+
+    Usage (sync.py / cron):
+        $env:TEST_RECORDS_FILE = 'test_collected_records.json'
+        poetry run python sync.py
+    """
+
+    def __init__(self, path: str):
+        import json
+        from pathlib import Path
+        resolved = Path(path).resolve()
+        with open(resolved, encoding="utf-8") as f:
+            raw: list[dict] = json.load(f)
+        self._records = sorted(raw, key=lambda r: (self._ts(r), r.get("id", "")))
+
+    @staticmethod
+    def _ts(r: dict) -> datetime:
+        ts_str = r.get("updated_at") or r.get("created_at") or ""
+        if not ts_str:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+
+    def fetch_records(
+        self,
+        since: datetime,
+        page: int,
+        page_size: int,
+        last_record_id: str = None,
+    ) -> dict:
+        filtered = []
+        for r in self._records:
+            rec_ts = self._ts(r)
+            if rec_ts < since:
+                continue
+            # Tie-break on page 1: skip same-timestamp records seen in previous sync
+            if rec_ts == since and last_record_id is not None and r.get("id", "") <= last_record_id:
+                continue
+            filtered.append(r)
+
+        start = (page - 1) * page_size
+        end = start + page_size
+        return {
+            "records": filtered[start:end],
+            "has_next": end < len(filtered),
+        }

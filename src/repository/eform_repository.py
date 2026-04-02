@@ -111,6 +111,30 @@ class EformRepository:
             is_active=True,
         ).count()
 
+    def get_collected_records_for_segment(self, session, segment_id: int) -> list[dict]:
+        """
+        Return ALL collected records for a segment (active + soft-deleted) as plain dicts.
+        Returning dicts avoids detached-instance errors after the session closes.
+        Timestamps are returned in full ISO-8601 format (with timezone offset).
+        """
+        rows = (
+            session.query(CollectedRecord)
+            .filter(CollectedRecord.segment_id == segment_id)
+            .order_by(CollectedRecord.vi_tri, CollectedRecord.first_seen_at)
+            .all()
+        )
+        return [
+            {
+                'source_record_id': r.source_record_id,
+                'vi_tri':           r.vi_tri,
+                'is_active':        r.is_active,
+                'first_seen_at':    r.first_seen_at.isoformat() if r.first_seen_at else '',
+                'last_synced_at':   r.last_synced_at.isoformat() if r.last_synced_at else '',
+                'raw_data':         r.raw_data or {},
+            }
+            for r in rows
+        ]
+
     # ── Unmapped records ──────────────────────────────────────────────────────
 
     def get_unresolved_unmapped(self, session):

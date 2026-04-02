@@ -5,7 +5,10 @@ Auto-checks:
 1. Quantity: active collected records per position >= so_can_vtX.
 2. No duplicate source_record_ids for the same segment + vi_tri.
 3. No wrong position (record tagged vi_tri=X but so_can_vtX is null for segment).
-4. Required fields: not configured → treated as passing (auto-advances to Hoàn thành).
+4. Required fields: not configured → treated as passing.
+
+Auto-check scope: only segments in 'Đủ vị trí' or 'Hoàn thành'.
+Segments in 'Dữ liệu sai hoặc lỗi' can only be cleared by manual inspector review.
 
 If all checks pass:  trang_thai = 'Hoàn thành'
 If any check fails:  trang_thai = 'Dữ liệu sai hoặc lỗi'
@@ -20,23 +23,38 @@ from src.repository.eform_repository import EformRepository
 
 logger = logging.getLogger(__name__)
 
+_REVIEWABLE_STATES = ('Đủ vị trí', 'Hoàn thành', 'Dữ liệu sai hoặc lỗi')
+
 
 class VerifierService:
     def __init__(self, repository: EformRepository):
         self.repo = repository
 
-    def run_auto_checks(self, nguoi_kiem_tra: str = 'system') -> dict:
+    def run_auto_checks(
+        self,
+        nguoi_kiem_tra: str = 'system',
+        segment_ids: set[int] | None = None,
+    ) -> dict:
         """
-        Run auto-checks on all active segments that are at 'Đủ vị trí' or later.
-        Returns a summary dict.
+        Run auto-checks on eligible segments.
+
+        Eligible: is_active=True and trang_thai in ('Đủ vị trí', 'Hoàn thành').
+        Segments in 'Dữ liệu sai hoặc lỗi' are intentionally excluded — only
+        manual inspector review can clear that state.
+
+        If segment_ids is provided, only those segments are checked (used for
+        scoped post-sync verification to avoid noisy full rescans).
         """
         passed = failed = skipped = 0
 
         with self.repo.session_scope() as session:
-            segs = session.query(Segment).filter(
+            q = session.query(Segment).filter(
                 Segment.is_active == True,
-                Segment.trang_thai.in_(['Đủ vị trí', 'Hoàn thành', 'Dữ liệu sai hoặc lỗi']),
-            ).all()
+                Segment.trang_thai.in_(['Đủ vị trí', 'Hoàn thành']),
+            )
+            if segment_ids is not None:
+                q = q.filter(Segment.id.in_(segment_ids))
+            segs = q.all()
 
             for seg in segs:
                 errors = self._check_segment(session, seg)
@@ -46,6 +64,7 @@ class VerifierService:
                     segment_id=seg.id,
                     nguoi_kiem_tra=nguoi_kiem_tra,
                     ket_qua=ket_qua,
+                    loai_kiem_tra='auto',
                     verified_at=datetime.now(timezone.utc),
                 )
                 session.add(log)
@@ -59,6 +78,51 @@ class VerifierService:
 
         logger.info(f"run_auto_checks: passed={passed}, failed={failed}, skipped={skipped}")
         return {'passed': passed, 'failed': failed, 'skipped': skipped}
+
+    def save_manual_finding(
+        self,
+        segment_id: int,
+        nguoi_kiem_tra: str,
+        finding_text: str,
+        outcome: str,
+    ) -> None:
+        """
+        Record a manual inspector review and update the segment's trang_thai.
+
+        outcome: 'pass' → 'Hoàn thành' | 'fail' → 'Dữ liệu sai hoặc lỗi'
+
+        Raises ValueError for blank inspector, invalid outcome, empty notes on fail,
+        or segment in a non-reviewable state.
+        """
+        if not nguoi_kiem_tra or not nguoi_kiem_tra.strip():
+            raise ValueError("Inspector name must not be empty.")
+        if outcome not in ('pass', 'fail'):
+            raise ValueError(f"outcome must be 'pass' or 'fail', got {outcome!r}.")
+        if outcome == 'fail' and not finding_text.strip():
+            raise ValueError("Notes are required when flagging an error.")
+
+        new_status = 'Hoàn thành' if outcome == 'pass' else 'Dữ liệu sai hoặc lỗi'
+
+        with self.repo.session_scope() as session:
+            seg = self.repo.get_segment_by_id(session, segment_id)
+            if seg is None:
+                raise ValueError(f"Segment {segment_id} not found.")
+            if seg.trang_thai not in _REVIEWABLE_STATES:
+                raise ValueError(
+                    f"Segment {segment_id} is in state '{seg.trang_thai}' and cannot be manually reviewed."
+                )
+            seg.trang_thai = new_status
+            session.add(VerificationLog(
+                segment_id=segment_id,
+                nguoi_kiem_tra=nguoi_kiem_tra.strip(),
+                ket_qua=f"MANUAL-{outcome.upper()}: {finding_text.strip() or 'no notes'}",
+                loai_kiem_tra='manual',
+                verified_at=datetime.now(timezone.utc),
+            ))
+        logger.info(
+            f"save_manual_finding: segment_id={segment_id}, outcome={outcome}, "
+            f"inspector={nguoi_kiem_tra!r}, new_status={new_status!r}"
+        )
 
     # ── Private ───────────────────────────────────────────────────────────────
 

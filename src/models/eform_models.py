@@ -209,6 +209,7 @@ class VerificationLog(Base):
     segment_id = Column(Integer, ForeignKey('segments.id', ondelete='CASCADE'), nullable=False)
     nguoi_kiem_tra = Column(Text)
     ket_qua = Column(Text)
+    loai_kiem_tra = Column(VARCHAR(10), nullable=False, server_default='auto')
     verified_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow, nullable=False)
 
     segment = relationship('Segment', back_populates='verification_logs')
