@@ -129,7 +129,13 @@ class SyncerService:
             )
             session.add(cr)
 
-        unmapped.resolved = True
+        resolved_rows = self.repo.resolve_unmapped_by_source_id(session, unmapped.source_record_id)
+        if resolved_rows:
+            logger.info(
+                "Resolved %s stale unmapped row(s) for source_record_id=%s via replay_unmapped",
+                resolved_rows,
+                unmapped.source_record_id,
+            )
         session.flush()
 
         segment = self.repo.get_segment_by_id(session, chosen_segment_id)
@@ -168,6 +174,7 @@ class SyncerService:
 
             if segment:
                 existing_cr.segment_id = segment.id
+                self._resolve_stale_unmapped(session, source_id)
                 affected_ids.add(segment.id)
                 self._recalculate_status(session, segment)
             else:
@@ -217,6 +224,7 @@ class SyncerService:
                 session.add(unmapped)
                 return False
 
+            self._resolve_stale_unmapped(session, source_id)
             affected_ids.add(segment.id)
             self._recalculate_status(session, segment)
             return True
@@ -265,6 +273,17 @@ class SyncerService:
             normalize(raw.get('ten_duong') or ''),
             normalize(doan_key),
         )
+
+    def _resolve_stale_unmapped(self, session, source_id: str) -> int:
+        """Resolve any stale unresolved unmapped rows now that the source ID maps."""
+        resolved_rows = self.repo.resolve_unmapped_by_source_id(session, source_id)
+        if resolved_rows:
+            logger.info(
+                "Auto-resolved %s stale unmapped row(s) for source_record_id=%s during sync",
+                resolved_rows,
+                source_id,
+            )
+        return resolved_rows
 
     def _recalculate_status(self, session, segment: Segment):
         if segment is None:

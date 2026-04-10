@@ -431,15 +431,13 @@ elif page == 'Sync Status':
         st.write(f"Last run: received={last_log.total_received}  "
                  f"mapped={last_log.total_mapped}  unmapped={last_log.total_unmapped}")
 
-    use_fixture = st.checkbox('Use test fixture (test_collected_records.json)')
+    fixture_file = st.file_uploader('Test fixture JSON (optional — leave empty to use live API)', type=['json'])
 
     if st.button('Run Sync Now'):
-        if use_fixture:
+        if fixture_file:
             syncer_to_run = SyncerService(
                 svc['repo'],
-                FileCollectionClient(
-                    r'C:\Users\phukt\gathering_data\eform-data-collection\test_collected_records.json'
-                ),
+                FileCollectionClient.from_bytes(fixture_file.read()),
             )
         else:
             syncer_to_run = svc['syncer']
@@ -483,9 +481,9 @@ elif page == 'Progress Dashboard':
     metrics = dashboard['metrics']
     status_counts = dashboard['status_counts']
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric('Total Needed', metrics['total_needed'])
-    col2.metric('Collected', metrics['total_collected'])
-    col3.metric('% Complete', f"{metrics['pct_complete']}%")
+    col1.metric('Số đoạn cần thu thập', metrics['total_needed'])
+    col2.metric('Số đoạn đã thu thập', metrics['total_collected'])
+    col3.metric('% Hoàn thiện', f"{metrics['pct_complete']}%")
     col4.metric('ETA', metrics['eta'])
 
     sc1, sc2, sc3, sc4, sc5 = st.columns(5)
@@ -498,6 +496,7 @@ elif page == 'Progress Dashboard':
     st.progress(min(max(metrics['pct_complete'] / 100, 0.0), 1.0))
 
     st.subheader('Overview Breakdown')
+    st.caption('Progress grouped by province, branch, and priority group (A/B/C).')
     overview_df = pd.DataFrame(dashboard['overview'])
     if overview_df.empty:
         st.info('No grouped progress data for the current filter.')
@@ -513,6 +512,7 @@ elif page == 'Progress Dashboard':
         st.dataframe(branch_df, width='stretch', hide_index=True)
 
     st.subheader('White Zones')
+    st.caption('Group A and B segments that still need more records, sorted by shortage.')
     white_zone_df = pd.DataFrame(dashboard['white_zones'])
     if white_zone_df.empty:
         st.success('No A/B white zones in the current filter.')
@@ -842,6 +842,26 @@ elif page == 'Verification':
                     (3, _vf_seg.so_can_vt3), (4, _vf_seg.so_can_vt4),
                 ] if req is not None
             }
+            # Load latest log overall; highlight flagged records only when latest verdict is still FAIL
+            _vf_latest_log = (
+                session.query(VerificationLog)
+                .filter(VerificationLog.segment_id == _vf_chosen_id)
+                .order_by(VerificationLog.verified_at.desc())
+                .first()
+            )
+            _vf_latest_is_fail = (
+                _vf_latest_log is not None
+                and _vf_latest_log.ket_qua is not None
+                and (
+                    _vf_latest_log.ket_qua.startswith('FAIL:')
+                    or _vf_latest_log.ket_qua.startswith('MANUAL-FAIL:')
+                )
+            )
+            _vf_prev_flagged = (
+                set(_vf_latest_log.source_record_ids)
+                if _vf_latest_is_fail and _vf_latest_log.source_record_ids
+                else set()
+            )
 
         _vf_active = [r for r in _vf_records if r['is_active']]
         _vf_inactive = [r for r in _vf_records if not r['is_active']]
@@ -872,7 +892,12 @@ elif page == 'Verification':
 
         if _vf_records:
             import pandas as pd
-            _vf_tbl = [{k: v for k, v in r.items() if k != 'raw_data'} for r in _vf_records]
+            if _vf_prev_flagged:
+                st.warning(f"Latest error log flagged {len(_vf_prev_flagged)} record(s): {sorted(_vf_prev_flagged)}")
+            _vf_tbl = [
+                {k: v for k, v in r.items() if k != 'raw_data'} | {'flagged': r['source_record_id'] in _vf_prev_flagged}
+                for r in _vf_records
+            ]
             st.dataframe(pd.DataFrame(_vf_tbl), hide_index=True)
             with st.expander('Raw data (JSON)'):
                 for r in _vf_records:
@@ -893,6 +918,16 @@ elif page == 'Verification':
             key='vf_notes', height=80,
         )
 
+        _vf_flagged_recs = []
+        if _vf_outcome_key == 'fail' and _vf_records:
+            _all_src_ids = [r['source_record_id'] for r in _vf_records]
+            _vf_flagged_recs = st.multiselect(
+                'Flag specific error records (optional — select records causing the failure)',
+                options=_all_src_ids,
+                default=[sid for sid in _all_src_ids if sid in _vf_prev_flagged],
+                key='vf_flagged_recs',
+            )
+
         if not inspector_valid:
             st.caption('Enter inspector name above before saving.')
         if st.button('Save Review', disabled=not inspector_valid):
@@ -902,6 +937,7 @@ elif page == 'Verification':
                     nguoi_kiem_tra=inspector.strip(),
                     finding_text=_vf_notes,
                     outcome=_vf_outcome_key,
+                    flagged_record_ids=_vf_flagged_recs or None,
                 )
                 st.session_state['vf_flash'] = True
                 st.session_state['vf_flash_msg'] = (
@@ -931,6 +967,7 @@ elif page == 'Verification':
             'type': l.loai_kiem_tra,
             'inspector': l.nguoi_kiem_tra,
             'result': l.ket_qua,
+            'flagged_records': ', '.join(l.source_record_ids) if l.source_record_ids else '—',
             'at': str(l.verified_at),
         } for l in _vf_logs]
     if _vf_rows:

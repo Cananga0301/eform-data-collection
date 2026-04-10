@@ -109,7 +109,8 @@ class AssignerService:
                     assignment.phu_trach = str(row['phu_trach']).strip()
                 if row.get('deadline'):
                     try:
-                        assignment.deadline = datetime.strptime(str(row['deadline']).strip(), '%Y-%m-%d').date()
+                        raw_deadline = str(row['deadline']).strip().split(' ')[0]
+                        assignment.deadline = datetime.strptime(raw_deadline, '%Y-%m-%d').date()
                     except ValueError:
                         pass
                 if row.get('branch'):

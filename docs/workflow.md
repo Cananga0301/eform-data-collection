@@ -321,14 +321,18 @@ This page generates the daily Excel report package.
 ### What this page is for
 
 This page supports both automatic structural checks and manual inspector review.
+It is also the place where a user can see which specific records were flagged by
+the latest failing verification result for a segment.
 
 ### What you can do here
 
 - Identify yourself as the current inspector.
 - Manually trigger auto-checks for all eligible segments.
 - Filter the manual-review queue by province and ward / zone.
-- Inspect one segment's linked records and raw payloads.
+- Inspect one segment's linked records, per-position counts, and raw payloads.
+- See which records were flagged by the latest failing verification log for that segment.
 - Save a manual review outcome that can change the segment's status.
+- When failing a segment manually, optionally tag the exact `source_record_id` values that caused the error.
 - Filter and read the verification log.
 
 ### Main workflows
@@ -339,29 +343,35 @@ This page supports both automatic structural checks and manual inspector review.
    1. Select **Province**.
    2. Select **Ward / Zone**.
    3. Select a **Segment**.
-   4. Review the linked records, per-position counts, and raw JSON.
-   5. Choose **Review outcome**.
-   6. Enter **Notes** if you are failing the segment.
-   7. Click **Save Review**.
+   4. Review the linked records, per-position counts, soft-deleted count, and raw JSON.
+   5. If the latest verification result for that segment is a fail with record-level flags, review the warning and the `flagged` column in the record table.
+   6. Choose **Review outcome**.
+   7. If you are failing the segment, enter **Notes** and optionally pick one or more records in **Flag specific error records**.
+   8. Click **Save Review**.
 4. In **Verification Log**, choose `All`, `auto only`, or `manual only` to filter the recent log entries.
 
 ### What happens after each action
 
-- After you enter inspector name, the manual controls become usable.
+- After you enter inspector name, both **Run Auto-Checks** and **Save Review** become usable.
 - After **Run Auto-Checks**, the verifier scans all eligible segments in `Đủ vị trí` or `Hoàn thành`, writes `auto` log rows, and updates each checked segment to either `Hoàn thành` or `Dữ liệu sai hoặc lỗi`.
 - In manual review, after you choose a segment, the page loads all linked collected records for that segment, including soft-deleted rows for audit.
+- After a segment is loaded for review, the page also loads that segment's latest verification log entry. If the latest result is still a fail and it contains `source_record_ids`, the page shows a warning listing those record IDs and marks the matching rows with `flagged = true`.
 - After **Save Review**, the app writes a `manual` verification log row with your name and updates the segment status:
   - `pass` -> `Hoàn thành`
   - `fail` -> `Dữ liệu sai hoặc lỗi`
+- If you selected records in **Flag specific error records**, those `source_record_id` values are saved into the manual verification log row.
 - After a successful manual review save, the page reruns and shows a success flash message at the top.
 - After changing the log filter, the log table refreshes to show the latest 200 matching entries.
+- In the log table, `flagged_records` shows a comma-separated list of `source_record_id` values when the verifier or inspector could identify specific bad records. It shows `—` when the result is a pass or when the failure is segment-level only, such as a quantity shortfall.
 
 ### Important notes / limits
 
 - Manual review is only allowed for segments currently in `Đủ vị trí`, `Hoàn thành`, or `Dữ liệu sai hoặc lỗi`.
 - Failing a segment requires non-empty notes.
+- Choosing specific error records during manual fail is optional, but if you do choose them they must belong to the selected segment.
 - Auto-checks intentionally skip segments already in `Dữ liệu sai hoặc lỗi`. Only manual review can clear that state.
 - Required-field verification is still not configured. The current checks are structural only.
+- Auto-checks can name specific records for some failure types, such as invalid positions. They cannot name a specific record for shortage failures like `vt1: need 3, have 1`.
 - The log table shows recent entries only. It is not a full history browser.
 
 ## Background / Non-page Workflows

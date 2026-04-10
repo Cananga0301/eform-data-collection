@@ -57,14 +57,16 @@ class VerifierService:
             segs = q.all()
 
             for seg in segs:
-                errors = self._check_segment(session, seg)
+                errors, flagged_ids = self._check_segment(session, seg)
                 ket_qua = 'PASS' if not errors else ('FAIL: ' + '; '.join(errors))
+                stored_ids = sorted(set(flagged_ids)) if flagged_ids else None
 
                 log = VerificationLog(
                     segment_id=seg.id,
                     nguoi_kiem_tra=nguoi_kiem_tra,
                     ket_qua=ket_qua,
                     loai_kiem_tra='auto',
+                    source_record_ids=stored_ids,
                     verified_at=datetime.now(timezone.utc),
                 )
                 session.add(log)
@@ -85,6 +87,7 @@ class VerifierService:
         nguoi_kiem_tra: str,
         finding_text: str,
         outcome: str,
+        flagged_record_ids: list[str] | None = None,
     ) -> None:
         """
         Record a manual inspector review and update the segment's trang_thai.
@@ -111,12 +114,25 @@ class VerifierService:
                 raise ValueError(
                     f"Segment {segment_id} is in state '{seg.trang_thai}' and cannot be manually reviewed."
                 )
+            if flagged_record_ids:
+                valid_ids = {
+                    r['source_record_id']
+                    for r in self.repo.get_collected_records_for_segment(session, segment_id)
+                }
+                bad = [rid for rid in flagged_record_ids if rid not in valid_ids]
+                if bad:
+                    raise ValueError(
+                        f"The following record IDs do not belong to segment {segment_id}: {bad}"
+                    )
+
+            stored_ids = sorted(set(flagged_record_ids)) if flagged_record_ids else None
             seg.trang_thai = new_status
             session.add(VerificationLog(
                 segment_id=segment_id,
                 nguoi_kiem_tra=nguoi_kiem_tra.strip(),
                 ket_qua=f"MANUAL-{outcome.upper()}: {finding_text.strip() or 'no notes'}",
                 loai_kiem_tra='manual',
+                source_record_ids=stored_ids,
                 verified_at=datetime.now(timezone.utc),
             ))
         logger.info(
@@ -126,8 +142,10 @@ class VerifierService:
 
     # ── Private ───────────────────────────────────────────────────────────────
 
-    def _check_segment(self, session, seg: Segment) -> list[str]:
+    def _check_segment(self, session, seg: Segment) -> tuple[list[str], list[str]]:
+        """Return (errors, flagged_source_record_ids)."""
         errors = []
+        flagged_ids = []
 
         positions = [
             (1, seg.so_can_vt1),
@@ -143,33 +161,35 @@ class VerifierService:
             count = self.repo.count_active_collected_by_segment_vitri(session, seg.id, vt)
             if count < req:
                 errors.append(f"vt{vt}: need {req}, have {count}")
+                # Missing records — no specific IDs to flag
 
         # Check for duplicate source_record_ids per segment + vi_tri
         dup_rows = (
-            session.query(CollectedRecord.vi_tri)
+            session.query(CollectedRecord.source_record_id, CollectedRecord.vi_tri)
             .filter_by(segment_id=seg.id, is_active=True)
             .group_by(CollectedRecord.source_record_id, CollectedRecord.vi_tri)
             .having(func.count(CollectedRecord.id) > 1)
             .all()
         )
         if dup_rows:
+            flagged_ids.extend(r.source_record_id for r in dup_rows)
             errors.append(f"duplicate source_record_ids at positions: {[r.vi_tri for r in dup_rows]}")
 
         # Check for wrong position (record at a vi_tri that doesn't exist for this segment)
         wrong_pos = (
-            session.query(CollectedRecord.vi_tri)
+            session.query(CollectedRecord.source_record_id, CollectedRecord.vi_tri)
             .filter(
                 CollectedRecord.segment_id == seg.id,
                 CollectedRecord.is_active == True,
                 CollectedRecord.vi_tri.notin_(list(active_positions)),
             )
-            .distinct()
             .all()
         )
         if wrong_pos:
+            flagged_ids.extend(r.source_record_id for r in wrong_pos)
             errors.append(f"records at invalid positions: {[r.vi_tri for r in wrong_pos]}")
 
         # Required-fields check: not configured → treated as passing.
         # Stub: always passes until business defines required fields.
 
-        return errors
+        return errors, flagged_ids

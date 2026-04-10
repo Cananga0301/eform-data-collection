@@ -71,6 +71,7 @@ def test_run_auto_checks_pass():
     assert added_log.ket_qua == 'PASS'
     assert added_log.loai_kiem_tra == 'auto'
     assert added_log.nguoi_kiem_tra == 'alice'
+    assert added_log.source_record_ids is None
 
 
 def test_run_auto_checks_fail_quantity():
@@ -133,6 +134,36 @@ def test_run_auto_checks_skips_error_state_segments():
     # Verify 'Dữ liệu sai hoặc lỗi' is NOT in the status filter
     filter_str = str(captured_filter_args)
     assert 'Dữ liệu sai hoặc lỗi' not in filter_str
+
+
+def test_run_auto_checks_wrong_position_flagged():
+    """Records at invalid positions are captured in source_record_ids on the log."""
+    repo, session = _make_repo()
+    seg = _make_seg(seg_id=3, trang_thai='Đủ vị trí', so_can_vt1=3)
+
+    # Quantity satisfied: 3 active records at vt1
+    repo.count_active_collected_by_segment_vitri.return_value = 3
+
+    # Mock row returned by the wrong-position query
+    bad_row = MagicMock()
+    bad_row.source_record_id = 'ID-BAD'
+    bad_row.vi_tri = 3
+
+    session.query.side_effect = [
+        _chainable([seg]),    # Segment query
+        _chainable([]),       # dup query — no dups (schema prevents this in practice)
+        _chainable([bad_row]),  # wrong-pos query
+    ]
+
+    svc = VerifierService(repo)
+    result = svc.run_auto_checks(nguoi_kiem_tra='system')
+
+    assert result == {'passed': 0, 'failed': 1, 'skipped': 0}
+    assert seg.trang_thai == 'Dữ liệu sai hoặc lỗi'
+
+    added_log = session.add.call_args[0][0]
+    assert added_log.source_record_ids == ['ID-BAD']
+    assert 'invalid positions' in added_log.ket_qua
 
 
 # ── save_manual_finding ───────────────────────────────────────────────────────

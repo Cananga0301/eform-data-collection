@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy.orm import sessionmaker
 
 from src.clients.collection_client import AbstractCollectionClient
-from src.models.eform_models import CollectedRecord, Segment, VerificationLog
+from src.models.eform_models import CollectedRecord, Segment, UnmappedRecord, VerificationLog
 from src.repository.eform_repository import EformRepository
 from src.service.syncer_service import SyncerService
 from src.service.verifier_service import VerifierService
@@ -115,7 +115,161 @@ def test_sync_run_returns_affected_segment_ids(db_engine):
         s.close()
 
 
-# ── Test 2: scope boundary — only segment_ids get checked, error state skipped ─
+def test_sync_resolves_stale_unmapped_rows_when_same_source_id_later_maps(db_engine):
+    repo, _, _ = _build_services(db_engine)
+
+    seg_id = _create_segment(db_engine, trang_thai='Chưa bắt đầu')
+    Session = sessionmaker(bind=db_engine)
+
+    bad_record = {
+        'id': 'TEST-REMATCH-001',
+        'tinh_thanh': 'Ho Chi Minh',
+        'xa_phuong': 'Wrong Ward',
+        'ten_duong': 'Duong A',
+        'doan': 'Doan 1',
+        'vi_tri': 1,
+        'updated_at': '2024-01-01T00:00:00Z',
+        'is_deleted': False,
+    }
+    good_record = {
+        'id': 'TEST-REMATCH-001',
+        'tinh_thanh': 'Ho Chi Minh',
+        'xa_phuong': 'Quan 1',
+        'ten_duong': 'Duong A',
+        'doan': 'Doan 1',
+        'vi_tri': 1,
+        'updated_at': '2024-01-02T00:00:00Z',
+        'is_deleted': False,
+    }
+
+    SyncerService(repo, ListCollectionClient([bad_record])).run()
+    affected_ids = SyncerService(repo, ListCollectionClient([good_record])).run()
+
+    assert seg_id in affected_ids
+
+    s = Session()
+    try:
+        cr = s.query(CollectedRecord).filter_by(source_record_id='TEST-REMATCH-001').one()
+        assert cr.segment_id == seg_id
+
+        unresolved = s.query(UnmappedRecord).filter_by(
+            source_record_id='TEST-REMATCH-001',
+            resolved=False,
+        ).count()
+        resolved = s.query(UnmappedRecord).filter_by(
+            source_record_id='TEST-REMATCH-001',
+            resolved=True,
+        ).count()
+        seg = s.query(Segment).filter_by(id=seg_id).one()
+
+        assert unresolved == 0
+        assert resolved == 1
+        assert seg.trang_thai == 'Đang thu thập'
+    finally:
+        s.close()
+
+
+def test_sync_still_unmapped_rerun_does_not_resolve_or_duplicate_rows(db_engine):
+    repo, _, _ = _build_services(db_engine)
+    Session = sessionmaker(bind=db_engine)
+
+    bad_record_v1 = {
+        'id': 'TEST-STILL-BAD-001',
+        'tinh_thanh': 'Ho Chi Minh',
+        'xa_phuong': 'Wrong Ward',
+        'ten_duong': 'Duong A',
+        'doan': 'Doan 1',
+        'vi_tri': 1,
+        'updated_at': '2024-01-01T00:00:00Z',
+        'is_deleted': False,
+    }
+    bad_record_v2 = {
+        'id': 'TEST-STILL-BAD-001',
+        'tinh_thanh': 'Ho Chi Minh',
+        'xa_phuong': 'Wronger Ward',
+        'ten_duong': 'Duong A',
+        'doan': 'Doan 1',
+        'vi_tri': 1,
+        'updated_at': '2024-01-02T00:00:00Z',
+        'is_deleted': False,
+    }
+
+    SyncerService(repo, ListCollectionClient([bad_record_v1])).run()
+    affected_ids = SyncerService(repo, ListCollectionClient([bad_record_v2])).run()
+
+    assert affected_ids == set()
+
+    s = Session()
+    try:
+        unresolved = s.query(UnmappedRecord).filter_by(
+            source_record_id='TEST-STILL-BAD-001',
+            resolved=False,
+        ).count()
+        resolved = s.query(UnmappedRecord).filter_by(
+            source_record_id='TEST-STILL-BAD-001',
+            resolved=True,
+        ).count()
+        cr = s.query(CollectedRecord).filter_by(source_record_id='TEST-STILL-BAD-001').one()
+
+        assert unresolved == 1
+        assert resolved == 0
+        assert cr.segment_id is None
+    finally:
+        s.close()
+
+
+def test_replay_unmapped_resolves_all_rows_for_same_source_id(db_engine):
+    repo, syncer, _ = _build_services(db_engine)
+    seg_id = _create_segment(db_engine, trang_thai='Chưa bắt đầu')
+    Session = sessionmaker(bind=db_engine)
+
+    s = Session()
+    try:
+        row1 = UnmappedRecord(
+            source_record_id='TEST-REPLAY-001',
+            raw_data={'vi_tri': 1, 'foo': 'bar'},
+            reason='segment_not_found',
+            resolved=False,
+        )
+        row2 = UnmappedRecord(
+            source_record_id='TEST-REPLAY-001',
+            raw_data={'vi_tri': 1, 'foo': 'baz'},
+            reason='segment_not_found_on_update',
+            resolved=False,
+        )
+        s.add_all([row1, row2])
+        s.commit()
+        chosen_unmapped_id = row1.id
+    finally:
+        s.close()
+
+    with repo.session_scope() as session:
+        affected_id = syncer.replay_unmapped(session, chosen_unmapped_id, seg_id)
+
+    assert affected_id == seg_id
+
+    s = Session()
+    try:
+        unresolved = s.query(UnmappedRecord).filter_by(
+            source_record_id='TEST-REPLAY-001',
+            resolved=False,
+        ).count()
+        resolved = s.query(UnmappedRecord).filter_by(
+            source_record_id='TEST-REPLAY-001',
+            resolved=True,
+        ).count()
+        cr = s.query(CollectedRecord).filter_by(source_record_id='TEST-REPLAY-001').one()
+        seg = s.query(Segment).filter_by(id=seg_id).one()
+
+        assert unresolved == 0
+        assert resolved == 2
+        assert cr.segment_id == seg_id
+        assert seg.trang_thai == 'Đang thu thập'
+    finally:
+        s.close()
+
+
+# ── Test 4: scope boundary — only segment_ids get checked, error state skipped ─
 
 def test_auto_checks_scope_boundary(db_engine):
     """

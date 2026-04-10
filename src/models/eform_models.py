@@ -210,6 +210,7 @@ class VerificationLog(Base):
     nguoi_kiem_tra = Column(Text)
     ket_qua = Column(Text)
     loai_kiem_tra = Column(VARCHAR(10), nullable=False, server_default='auto')
+    source_record_ids = Column(JSONB)   # list[str] of source_record_id values — nullable
     verified_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow, nullable=False)
 
     segment = relationship('Segment', back_populates='verification_logs')

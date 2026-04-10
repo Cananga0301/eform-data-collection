@@ -140,6 +140,13 @@ class EformRepository:
     def get_unresolved_unmapped(self, session):
         return session.query(UnmappedRecord).filter_by(resolved=False).all()
 
+    def resolve_unmapped_by_source_id(self, session, source_record_id: str) -> int:
+        """Mark all unresolved unmapped rows for this source ID as resolved."""
+        return session.query(UnmappedRecord).filter_by(
+            source_record_id=source_record_id,
+            resolved=False,
+        ).update({'resolved': True}, synchronize_session=False)
+
     # ── Sync infrastructure ───────────────────────────────────────────────────
 
     def get_sync_cursor(self, session):

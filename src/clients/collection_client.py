@@ -86,9 +86,18 @@ class FileCollectionClient(AbstractCollectionClient):
         import json
         from pathlib import Path
         resolved = Path(path).resolve()
-        with open(resolved, encoding="utf-8") as f:
+        with open(resolved, encoding="utf-8-sig") as f:
             raw: list[dict] = json.load(f)
         self._records = sorted(raw, key=lambda r: (self._ts(r), r.get("id", "")))
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> 'FileCollectionClient':
+        """Load records from raw JSON bytes (e.g. from st.file_uploader)."""
+        import json
+        instance = cls.__new__(cls)
+        raw: list[dict] = json.loads(data.decode('utf-8-sig'))
+        instance._records = sorted(raw, key=lambda r: (cls._ts(r), r.get("id", "")))
+        return instance
 
     @staticmethod
     def _ts(r: dict) -> datetime:
