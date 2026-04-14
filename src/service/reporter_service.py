@@ -13,7 +13,7 @@ from typing import Optional
 
 import openpyxl
 from openpyxl.styles import PatternFill
-from sqlalchemy import func
+from sqlalchemy import func, cast, Date as SADate
 from sqlalchemy.orm import joinedload
 
 from config import BRANCH_ALERT_DAYS, ETA_WINDOW_DAYS
@@ -24,6 +24,7 @@ from src.utils.text import normalize
 logger = logging.getLogger(__name__)
 
 YELLOW_FILL = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
+RED_FILL = PatternFill(start_color='F8D7DA', end_color='F8D7DA', fill_type='solid')
 STATUS_NOT_STARTED = normalize('Chưa bắt đầu')
 STATUS_IN_PROGRESS = normalize('Đang thu thập')
 STATUS_ENOUGH_POSITIONS = normalize('Đủ vị trí')
@@ -91,6 +92,7 @@ class ReporterService:
                 'overview': self._build_breakdown_rows(segment_rows),
                 'branch_activity': self._build_branch_activity_rows(segment_rows),
                 'white_zones': self._build_white_zone_rows(segment_rows),
+                'employee_stats': self._build_employee_stats_rows(session, segments, segment_rows),
                 'recent_days': BRANCH_ALERT_DAYS,
             }
 
@@ -108,6 +110,7 @@ class ReporterService:
         self._build_dashboard_overview_sheet(wb, dashboard)
         self._build_dashboard_branch_activity_sheet(wb, dashboard)
         self._build_dashboard_white_zones_sheet(wb, dashboard)
+        self._build_dashboard_employee_stats_sheet(wb, dashboard)
 
         buf = BytesIO()
         wb.save(buf)
@@ -325,6 +328,124 @@ class ReporterService:
         rows.sort(key=lambda row: (-row['Missing'], row['Province'], row['Ward / Zone'], row['Road']))
         return rows
 
+    def _build_employee_stats_rows(
+        self,
+        session,
+        segments: list[Segment],
+        segment_rows: list[dict],
+    ) -> list[dict]:
+        from zoneinfo import ZoneInfo
+        seg_ids = [s.id for s in segments]
+        if not seg_ids:
+            return []
+
+        VN_TZ = ZoneInfo('Asia/Ho_Chi_Minh')
+        today_vn = datetime.now(VN_TZ).date()
+
+        vn_date = cast(func.timezone('Asia/Ho_Chi_Minh', CollectedRecord.first_seen_at), SADate)
+
+        before_deadline_counts = dict(
+            session.query(CollectedRecord.segment_id, func.count(CollectedRecord.id))
+            .join(Assignment, Assignment.segment_id == CollectedRecord.segment_id)
+            .filter(
+                CollectedRecord.segment_id.in_(seg_ids),
+                CollectedRecord.is_active == True,
+                Assignment.deadline.isnot(None),
+                vn_date <= Assignment.deadline,
+            )
+            .group_by(CollectedRecord.segment_id)
+            .all()
+        )
+
+        after_deadline_counts = dict(
+            session.query(CollectedRecord.segment_id, func.count(CollectedRecord.id))
+            .join(Assignment, Assignment.segment_id == CollectedRecord.segment_id)
+            .filter(
+                CollectedRecord.segment_id.in_(seg_ids),
+                CollectedRecord.is_active == True,
+                Assignment.deadline.isnot(None),
+                vn_date > Assignment.deadline,
+            )
+            .group_by(CollectedRecord.segment_id)
+            .all()
+        )
+
+        inactive_counts = dict(
+            session.query(CollectedRecord.segment_id, func.count(CollectedRecord.id))
+            .filter(
+                CollectedRecord.segment_id.in_(seg_ids),
+                CollectedRecord.is_active == False,
+            )
+            .group_by(CollectedRecord.segment_id)
+            .all()
+        )
+
+        UNASSIGNED = '(Chưa phân công)'
+        emp = defaultdict(lambda: {
+            'branch': '', 'employee_display': '',
+            'segments': 0, 'needed': 0, 'collected': 0,
+            'before_deadline': 0, 'after_deadline': 0, 'no_deadline': 0,
+            'overdue_open_segments': 0, 'error_segments': 0,
+            'inactive_records': 0, 'new_last_nd': 0,
+        })
+
+        for row in segment_rows:
+            person_raw = (row['person'] or '').strip()
+            person_norm = normalize(person_raw) if person_raw else ''
+            key = (row['branch'], person_norm)
+
+            data = emp[key]
+            data['branch'] = row['branch']
+            if not data['employee_display']:
+                data['employee_display'] = person_raw if person_raw else UNASSIGNED
+            data['segments']         += 1
+            data['needed']           += row['needed']
+            data['collected']        += row['collected']
+            data['new_last_nd']      += row['new_last_2d']
+            data['inactive_records'] += int(inactive_counts.get(row['segment_id'], 0))
+
+            if normalize(row['status']) == STATUS_ERROR:
+                data['error_segments'] += 1
+
+            data['before_deadline'] += int(before_deadline_counts.get(row['segment_id'], 0))
+            data['after_deadline']  += int(after_deadline_counts.get(row['segment_id'], 0))
+
+            if not row['deadline']:
+                data['no_deadline'] += row['collected']
+
+            if row['deadline'] and row['deadline'] < today_vn.isoformat() and row['missing'] > 0:
+                data['overdue_open_segments'] += 1
+
+        recent_label = f'New (last {BRANCH_ALERT_DAYS}d)'
+        result = []
+        for (_, __), data in emp.items():
+            missing = max(data['needed'] - data['collected'], 0)
+            pct = round(data['collected'] / data['needed'] * 100, 1) if data['needed'] else 0.0
+            is_overdue = data['overdue_open_segments'] > 0
+            is_idle = data['new_last_nd'] == 0 and missing > 0 and not is_overdue
+            result.append({
+                'Branch':                data['branch'],
+                'Employee':              data['employee_display'],
+                'Segments':              data['segments'],
+                'Needed':                data['needed'],
+                'Collected':             data['collected'],
+                'Missing':               missing,
+                '% Complete':            pct,
+                'Before Deadline':       data['before_deadline'],
+                'After Deadline':        data['after_deadline'],
+                'Overdue Open Segments': data['overdue_open_segments'],
+                'Error Segments':        data['error_segments'],
+                recent_label:            data['new_last_nd'],
+                'No Deadline':           data['no_deadline'],
+                'Inactive Records':      data['inactive_records'],
+                '_overdue':    is_overdue,
+                '_idle':       is_idle,
+                '_unassigned': data['employee_display'] == UNASSIGNED,
+            })
+
+        result.sort(key=lambda r: (-r['Overdue Open Segments'], -r['Missing'], r['% Complete']))
+        return result
+
     def _build_sheet1(self, wb, overview_rows: list[dict]):
         ws = wb.create_sheet('Overview')
         headers = ['Province', 'Branch', 'Group', 'Total Needed', 'Collected', '% Done', 'New (last 2d)']
@@ -446,6 +567,41 @@ class ReporterService:
                 row['Status'],
                 row['Missing'],
             ])
+
+    def _build_dashboard_employee_stats_sheet(self, wb, dashboard: dict):
+        ws = wb.create_sheet('Employee Stats')
+        recent_days = dashboard['recent_days']
+        recent_label = f'New (last {recent_days}d)'
+        headers = [
+            'Branch', 'Employee', 'Segments', 'Needed', 'Collected', 'Missing',
+            '% Complete', 'Before Deadline', 'After Deadline', 'Overdue Open Segments',
+            'Error Segments', recent_label, 'No Deadline', 'Inactive Records',
+        ]
+        ws.append(headers)
+
+        for row in dashboard['employee_stats']:
+            ws.append([
+                row['Branch'],
+                row['Employee'],
+                row['Segments'],
+                row['Needed'],
+                row['Collected'],
+                row['Missing'],
+                row['% Complete'],
+                row['Before Deadline'],
+                row['After Deadline'],
+                row['Overdue Open Segments'],
+                row['Error Segments'],
+                row[recent_label],
+                row['No Deadline'],
+                row['Inactive Records'],
+            ])
+            if row.get('_overdue'):
+                for cell in ws[ws.max_row]:
+                    cell.fill = RED_FILL
+            elif row.get('_idle'):
+                for cell in ws[ws.max_row]:
+                    cell.fill = YELLOW_FILL
 
     def _compute_eta(
         self,

@@ -48,10 +48,8 @@ def get_services():
 
 
 PAGES = [
-    'Import & Classify',
-    'HO Review / Group Override',
-    'Branch Mapping',
-    'Assignment Export / Import',
+    'Import & Review',
+    'Branch Mapping & Assignments',
     'Sync Status',
     'Progress Dashboard',
     'Unmapped Records',
@@ -67,10 +65,11 @@ page = st.sidebar.radio('Navigate', PAGES)
 
 svc = get_services()
 
-# ── Page 1: Import & Classify ─────────────────────────────────────────────────
+# ── Page 1+2: Import & Review ─────────────────────────────────────────────────
 
-if page == 'Import & Classify':
-    st.header('Import & Classify')
+if page == 'Import & Review':
+    st.header('Import & Review')
+    st.subheader('Import & Classify')
     st.write('Upload 1–3 Excel files (HCM, Hà Nội, Đồng Nai) to import route segments.')
 
     uploaded = st.file_uploader('Upload Excel files', type=['xlsx'], accept_multiple_files=True)
@@ -104,10 +103,10 @@ if page == 'Import & Classify':
             st.success('Import complete.')
         st.dataframe(results)
 
-# ── Page 2: HO Review / Group Override ───────────────────────────────────────
+    # ── Section 2: HO Review / Group Override ────────────────────────────────
 
-elif page == 'HO Review / Group Override':
-    st.header('HO Review / Group Override')
+    st.divider()
+    st.subheader('HO Review / Group Override')
 
     # ── Filter row ───────────────────────────────────────────────────────────
     with svc['repo'].session_scope() as session:
@@ -303,10 +302,11 @@ elif page == 'HO Review / Group Override':
     if st.session_state.get('ho_review_export'):
         st.download_button('Download', st.session_state['ho_review_export'], 'ho_review.xlsx')
 
-# ── Page 3: Branch Mapping ────────────────────────────────────────────────────
+# ── Page 3+4: Branch Mapping & Assignments ───────────────────────────────────
 
-elif page == 'Branch Mapping':
-    st.header('Branch Mapping (Admin)')
+elif page == 'Branch Mapping & Assignments':
+    st.header('Branch Mapping & Assignments')
+    st.subheader('Branch Mapping (Admin)')
 
     with svc['repo'].session_scope() as session:
         from src.models.eform_models import Branch, BranchMapping
@@ -371,10 +371,10 @@ elif page == 'Branch Mapping':
         st.rerun()
 
 
-# ── Page 4: Assignment Export / Import ───────────────────────────────────────
+    # ── Section 4: Assignment Export / Import ────────────────────────────────
 
-elif page == 'Assignment Export / Import':
-    st.header('Assignment Export / Import')
+    st.divider()
+    st.subheader('Assignment Export / Import')
 
     col1, col2 = st.columns(2)
     with col1:
@@ -518,6 +518,56 @@ elif page == 'Progress Dashboard':
         st.success('No A/B white zones in the current filter.')
     else:
         st.dataframe(white_zone_df, width='stretch', hide_index=True)
+
+    st.subheader('Employee Statistics')
+    st.caption(
+        "Stats reflect the **current** assignee (re-import overwrites phu_trach). "
+        "Before/after deadline uses first_seen_at converted to Vietnam time (UTC+7), "
+        "not the actual field collection date."
+    )
+    _emp_rows = dashboard['employee_stats']
+    if not _emp_rows:
+        st.info('No employee data for the current filter.')
+    else:
+        _recent_label = f"New (last {dashboard['recent_days']}d)"
+
+        _n_assigned  = sum(1 for r in _emp_rows if not r['_unassigned'])
+        _n_attention = sum(1 for r in _emp_rows if r['_idle'])
+        _n_overdue   = sum(1 for r in _emp_rows if r['_overdue'])
+        _n_error     = sum(1 for r in _emp_rows if r['Error Segments'] > 0)
+        _ec1, _ec2, _ec3, _ec4 = st.columns(4)
+        _ec1.metric('Employees Assigned', _n_assigned)
+        _ec2.metric('Need Attention',     _n_attention)
+        _ec3.metric('Overdue',            _n_overdue)
+        _ec4.metric('In Error',           _n_error)
+
+        _primary_cols = [
+            'Branch', 'Employee', 'Segments', 'Needed', 'Collected', 'Missing',
+            '% Complete', 'Before Deadline', 'After Deadline', 'Overdue Open Segments',
+            'Error Segments', _recent_label, 'No Deadline', 'Inactive Records',
+        ]
+        _overdue_keys    = {(r['Branch'], r['Employee']) for r in _emp_rows if r['_overdue']}
+        _idle_keys       = {(r['Branch'], r['Employee']) for r in _emp_rows if r['_idle']}
+        _unassigned_keys = {(r['Branch'], r['Employee']) for r in _emp_rows if r['_unassigned']}
+
+        _emp_display = [{k: r[k] for k in _primary_cols} for r in _emp_rows]
+        _emp_df = pd.DataFrame(_emp_display)
+
+        def _highlight_emp(row):
+            key = (row['Branch'], row['Employee'])
+            if key in _overdue_keys:
+                return ['background-color: #f8d7da'] * len(row)
+            if key in _idle_keys:
+                return ['background-color: #fff3cd'] * len(row)
+            if key in _unassigned_keys:
+                return ['color: #888888'] * len(row)
+            return [''] * len(row)
+
+        st.dataframe(
+            _emp_df.style.apply(_highlight_emp, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     st.subheader('Segment Record Detail')
 
