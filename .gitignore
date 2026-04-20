@@ -18,3 +18,4 @@ logs/*.log
 htmlcov/
 poetry.toml
 alembic/versions/.gitkeep
+.claude/
